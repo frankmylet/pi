@@ -1,0 +1,47 @@
+{
+	"name": "cost-tier-demo",
+	"description": "Minimal Pi-native workflow policy demo: cheap scout, mid-tier implement, Opus architect only when explicitly allowed.",
+	"policy": {
+		"tiers": {
+			"scout": {
+				"provider": "anthropic",
+				"model": "claude-haiku-4-5-20251001",
+				"effort": "low",
+				"maxCostUsd": 0.25,
+				"tools": ["read", "grep", "find", "ls"]
+			},
+			"implement": {
+				"provider": "openai-codex",
+				"model": "gpt-5.5",
+				"effort": "medium",
+				"maxCostUsd": 2,
+				"tools": ["read", "bash", "edit", "write"]
+			},
+			"architect": {
+				"provider": "anthropic",
+				"model": "claude-opus-4-8",
+				"effort": "high",
+				"maxCostUsd": 3,
+				"tools": ["read", "grep", "find", "ls"],
+				"requiresExplicitOptIn": true
+			}
+		}
+	},
+	"jobs": [
+		{
+			"id": "survey",
+			"tier": "scout",
+			"prompt": "Read-only scout pass for: {{task}}\n\nReturn the 5 most relevant files, likely risks, and the cheapest next step. Do not edit files."
+		},
+		{
+			"id": "patch",
+			"tier": "implement",
+			"prompt": "Implement the smallest safe patch for: {{task}}\n\nKeep scope tight. Run only targeted validation. Stop if the scout result reveals missing requirements."
+		},
+		{
+			"id": "architecture-review",
+			"tier": "architect",
+			"prompt": "Architecture-only review for: {{task}}\n\nDo not edit. Decide whether the implementation direction is fundamentally sound, and list any high-severity design risks."
+		}
+	]
+}
