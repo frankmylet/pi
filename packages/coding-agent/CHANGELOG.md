@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a Pi Agents example extension with `/pi-dispatch` for Pi-native background workers and `/pi-agents` for a terminal roster, defaulting to `openai-codex/gpt-5.5`.
+- Added a Cross-Agent Context example extension for owner-approved context sharing between live Pi sessions via `@agent:<alias>` requests and `agent_context_*` tools, backed by a local filesystem contract store.
+
 ## [0.78.0] - 2026-05-29
 
 ### New Features

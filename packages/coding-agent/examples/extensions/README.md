@@ -51,6 +51,8 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 | `handoff.ts` | Transfer context to a new focused session via `/handoff <goal>` |
 | `agent-bus-mirror.ts` | Mirror Pi session lifecycle events to a nineight Agent Bus endpoint for federated roster demos |
 | `claude-dispatch.ts` | Spawn Claude Code background workers via `/dispatch <prompt-or-plan.md>` without writing Claude Agent View internals |
+| `pi-agents.ts` | Pi-native `/pi-dispatch` background workers plus `/pi-agents` terminal roster, defaulting to `openai-codex/gpt-5.5` |
+| `cross-agent-context/` | Owner-approved context sharing between live Pi sessions via `@agent:<alias>` and `agent_context_*` tools, backed by a local filesystem contract |
 | `cost-tier-workflow.ts` | Demo `/cost-workflow` command that previews Pi job routing with explicit model, effort, maxCostUsd, tools, and Opus opt-in gating |
 | `qna.ts` | Extracts questions from last response into editor via `ctx.ui.setEditorText()` |
 | `status-line.ts` | Shows turn progress in footer via `ctx.ui.setStatus()` with themed colors |

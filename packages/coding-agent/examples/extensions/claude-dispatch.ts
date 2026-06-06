@@ -16,7 +16,7 @@
 
 import { access, readFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseDocument } from "yaml";
 
 type Effort = "low" | "medium" | "high" | "xhigh" | "max";
