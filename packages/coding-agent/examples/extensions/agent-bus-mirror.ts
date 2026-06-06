@@ -28,7 +28,7 @@ import type {
 	AgentSessionEvent,
 	ExtensionAPI,
 	ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 
 // Keep the Agent Bus projection self-contained so this global extension works
 // with the installed Pi package as well as with pi-mono checkouts where these
@@ -142,7 +142,7 @@ export default function agentBusMirrorExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_start", mirror);
-	pi.on("agent_end", mirror);
+	pi.on("agent_end", (event, ctx) => mirror({ ...event, willRetry: false }, ctx));
 	pi.on("turn_start", mirror);
 	pi.on("turn_end", mirror);
 	pi.on("message_start", mirror);
