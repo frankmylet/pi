@@ -1,3 +1,10 @@
+> **FORK NOTICE (2026-06-11):** this checkout is `frankmylet/pi`, a fork
+> carrying local nineight-integration extensions (agent-bus-mirror,
+> cross-agent-context, Pi background workers). The Releasing and Issues
+> sections below apply to UPSTREAM only — never push release tags from this
+> fork (the npm publish environment does not exist here). Pi↔nineight
+> bridge: the sole path is agent-bus-mirror.
+
 # Development Rules
 
 ## Conversational Style
