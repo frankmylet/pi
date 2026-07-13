@@ -564,6 +564,32 @@ pi.on("agent_settled", async (_event, ctx) => {
 });
 ```
 
+Extensions can register out-of-band work for Pi to drain after every `agent_settled` handler and the public settled event have finished:
+
+```typescript
+pi.registerSettledOperation<{ snapshot: string }>("persist-snapshot", {
+  handler: async (input, ctx) => {
+    // ctx is a fresh ExtensionContext plus core-authored operation metadata
+    // and a signal that aborts on reload, disposal, or superseding work.
+    await persistSnapshot(input.snapshot, ctx.signal);
+  },
+});
+
+pi.on("agent_settled", () => {
+  const result = pi.scheduleSettledOperation({
+    name: "persist-snapshot",
+    input: { snapshot: "..." },
+    dedupeKey: "current-snapshot",
+  });
+  if (!result.accepted) return;
+  // result.operation.operationId and origin are assigned by Pi.
+});
+```
+
+Inputs must be JSON-serializable. A `dedupeKey` is scoped to the owning extension registration and current session extension generation. Scheduling is immediate; do not await terminal work from `agent_settled`. Pi resolves the owning registration again at drain time and cancels work on duplicate keys, source drift, abort, reload, disposal, or a newer admitted prompt. The operation context deliberately excludes command-only methods such as `newSession`, `switchSession`, and `fork`.
+
+Settled operations are control work, not model input. Do not invoke them through slash commands, `sendUserMessage()`, synthetic prompts, or captured command contexts.
+
 #### turn_start / turn_end
 
 Fired for each turn (one LLM response + tool calls).

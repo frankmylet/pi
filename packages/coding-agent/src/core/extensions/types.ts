@@ -58,6 +58,12 @@ import type {
 	SessionEntry,
 	SessionManager,
 } from "../session-manager.ts";
+import type {
+	JsonValue,
+	ScheduleSettledOperationRequest,
+	SessionOperationAcceptance,
+	SettledOperationRegistration,
+} from "../session-operation.ts";
 import type { SlashCommandInfo } from "../slash-commands.ts";
 import type { SourceInfo } from "../source-info.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
@@ -1223,6 +1229,17 @@ export interface ExtensionAPI {
 	// Command, Shortcut, Flag Registration
 	// =========================================================================
 
+	/** Register an out-of-band operation that may run after an agent run fully settles. */
+	registerSettledOperation<TInput extends JsonValue = JsonValue>(
+		name: string,
+		registration: SettledOperationRegistration<TInput>,
+	): void;
+
+	/** Schedule a registered operation without adding model-visible input. */
+	scheduleSettledOperation<TInput extends JsonValue = JsonValue>(
+		request: ScheduleSettledOperationRequest<TInput>,
+	): SessionOperationAcceptance;
+
 	/** Register a custom command. */
 	registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void;
 
@@ -1539,6 +1556,11 @@ export type SetThinkingLevelHandler = (level: ThinkingLevel) => void;
 
 export type SetLabelHandler = (entryId: string, label: string | undefined) => void;
 
+export type ScheduleSettledOperationHandler = (
+	ownerPath: string,
+	request: ScheduleSettledOperationRequest,
+) => SessionOperationAcceptance;
+
 /**
  * Shared state created by loader, used during registration and runtime.
  * Contains flag values (defaults set during registration, CLI values set after).
@@ -1580,6 +1602,7 @@ export interface ExtensionActions {
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
 	setThinkingLevel: SetThinkingLevelHandler;
+	scheduleSettledOperation?: ScheduleSettledOperationHandler;
 }
 
 /**
@@ -1630,7 +1653,9 @@ export interface ExtensionCommandContextActions {
  * Full runtime = state + actions.
  * Created by loader with throwing action stubs, completed by runner.initialize().
  */
-export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {}
+export interface ExtensionRuntime extends ExtensionRuntimeState, Omit<ExtensionActions, "scheduleSettledOperation"> {
+	scheduleSettledOperation: ScheduleSettledOperationHandler;
+}
 
 /** Loaded extension with all registered items. */
 export interface Extension {
@@ -1642,6 +1667,7 @@ export interface Extension {
 	messageRenderers: Map<string, MessageRenderer>;
 	entryRenderers?: Map<string, EntryRenderer>;
 	commands: Map<string, RegisteredCommand>;
+	settledOperations?: Map<string, SettledOperationRegistration>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
 }

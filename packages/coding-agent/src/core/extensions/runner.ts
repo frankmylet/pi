@@ -10,6 +10,12 @@ import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { SessionManager } from "../session-manager.ts";
+import type {
+	JsonValue,
+	SessionOperationMetadata,
+	SettledOperationContext,
+	SettledOperationRegistration,
+} from "../session-operation.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
 import type {
 	BeforeAgentStartEvent,
@@ -331,6 +337,8 @@ export class ExtensionRunner {
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
+		this.runtime.scheduleSettledOperation =
+			actions.scheduleSettledOperation ?? (() => ({ accepted: false, code: "not_settling" }));
 
 		// Context actions (required)
 		this.getModel = contextActions.getModel;
@@ -416,6 +424,10 @@ export class ExtensionRunner {
 
 	getExtensionPaths(): string[] {
 		return this.extensions.map((e) => e.path);
+	}
+
+	getExtensionSource(extensionPath: string): Extension["sourceInfo"] | undefined {
+		return this.extensions.find((extension) => extension.path === extensionPath)?.sourceInfo;
 	}
 
 	/** Get all registered tools from all extensions (first registration per name wins). */
@@ -614,6 +626,28 @@ export class ExtensionRunner {
 
 	getCommand(name: string): ResolvedCommand | undefined {
 		return this.resolveRegisteredCommands().find((command) => command.invocationName === name);
+	}
+
+	getSettledOperation(ownerPath: string, name: string): SettledOperationRegistration<JsonValue> | undefined {
+		return this.extensions.find((extension) => extension.path === ownerPath)?.settledOperations?.get(name);
+	}
+
+	createSettledOperationContext(metadata: SessionOperationMetadata, signal: AbortSignal): SettledOperationContext {
+		const context = Object.defineProperties(
+			{},
+			Object.getOwnPropertyDescriptors(this.createContext()),
+		) as SettledOperationContext;
+		Object.defineProperty(context, "operation", {
+			configurable: true,
+			enumerable: true,
+			value: metadata,
+		});
+		Object.defineProperty(context, "signal", {
+			configurable: true,
+			enumerable: true,
+			value: signal,
+		});
+		return context;
 	}
 
 	/**

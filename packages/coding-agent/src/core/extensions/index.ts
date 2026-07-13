@@ -2,6 +2,16 @@
  * Extension system for lifecycle events and custom tools.
  */
 
+export type {
+	JsonPrimitive,
+	JsonValue,
+	ScheduleSettledOperationRequest,
+	SessionOperationAcceptance,
+	SessionOperationMetadata,
+	SessionOperationRejectionCode,
+	SettledOperationContext,
+	SettledOperationRegistration,
+} from "../session-operation.ts";
 export type { SlashCommandInfo, SlashCommandSource } from "../slash-commands.ts";
 export type { SourceInfo } from "../source-info.ts";
 export {

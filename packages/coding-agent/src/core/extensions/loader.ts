@@ -27,6 +27,7 @@ import { resolvePath } from "../../utils/paths.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
+import type { SettledOperationRegistration } from "../session-operation.ts";
 import { createSyntheticSourceInfo } from "../source-info.ts";
 import { time } from "../timings.ts";
 import type {
@@ -184,6 +185,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		setModel: () => Promise.reject(new Error("Extension runtime not initialized")),
 		getThinkingLevel: notInitialized,
 		setThinkingLevel: notInitialized,
+		scheduleSettledOperation: notInitialized,
 		flagValues: new Map(),
 		pendingProviderRegistrations: [],
 		assertActive,
@@ -232,6 +234,29 @@ function createExtensionAPI(
 				sourceInfo: extension.sourceInfo,
 			});
 			runtime.refreshTools();
+		},
+
+		registerSettledOperation(name, registration): void {
+			runtime.assertActive();
+			if (typeof name !== "string" || name.trim().length === 0 || name.length > 128) {
+				throw new Error("Settled operation name must be non-empty and at most 128 characters");
+			}
+			if (typeof registration?.handler !== "function") {
+				throw new Error(`Settled operation ${name} must define a handler`);
+			}
+			if (!extension.settledOperations) {
+				extension.settledOperations = new Map();
+			}
+			const settledOperations = extension.settledOperations;
+			if (settledOperations.has(name)) {
+				throw new Error(`Settled operation already registered: ${name}`);
+			}
+			settledOperations.set(name, registration as SettledOperationRegistration);
+		},
+
+		scheduleSettledOperation(request) {
+			runtime.assertActive();
+			return runtime.scheduleSettledOperation(extension.path, request);
 		},
 
 		registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void {
@@ -424,6 +449,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		messageRenderers: new Map(),
 		entryRenderers: new Map(),
 		commands: new Map(),
+		settledOperations: new Map(),
 		flags: new Map(),
 		shortcuts: new Map(),
 	};
