@@ -572,10 +572,22 @@ export class AgentSession {
 		resolve();
 	}
 
+	private _restoreIdleAfterPreflight(promptGeneration: number): void {
+		if (this._activePromptGeneration !== promptGeneration || this._lifecycleState !== "preflighting") {
+			return;
+		}
+		this._abortedPromptGenerations.delete(promptGeneration);
+		this._lifecycleState = "idle";
+		this._resolveIdleWaitIfIdle();
+	}
+
 	private async _emitAgentSettled(promptGeneration: number): Promise<void> {
 		if (this._lifecycleState === "disposed") {
 			this._abortedPromptGenerations.delete(promptGeneration);
 			this._resolveIdleWaitIfIdle();
+			return;
+		}
+		if (this._activePromptGeneration !== promptGeneration || this._lifecycleState !== "settling") {
 			return;
 		}
 		this._lifecycleState = "settled_control";
@@ -586,7 +598,7 @@ export class AgentSession {
 			await this._drainSettledOperations(promptGeneration);
 		} finally {
 			this._abortedPromptGenerations.delete(promptGeneration);
-			if (this._lifecycleState === "settled_control") {
+			if (this._activePromptGeneration === promptGeneration && this._lifecycleState === "settled_control") {
 				this._lifecycleState = "idle";
 			}
 			this._resolveIdleWaitIfIdle();
@@ -1249,10 +1261,7 @@ export class AgentSession {
 		}
 	}
 
-	private async _runAgentPrompt(
-		messages: AgentMessage | AgentMessage[],
-		promptGeneration = ++this._promptGeneration,
-	): Promise<void> {
+	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[], promptGeneration: number): Promise<void> {
 		if (this._lifecycleState === "disposed") {
 			throw new Error("Agent session is disposed");
 		}
@@ -1269,7 +1278,7 @@ export class AgentSession {
 			if (this._isDisposed()) {
 				this._abortedPromptGenerations.delete(promptGeneration);
 				this._resolveIdleWaitIfIdle();
-			} else {
+			} else if (this._activePromptGeneration === promptGeneration && this._lifecycleState === "running") {
 				this._lifecycleState = "settling";
 				await this._emitAgentSettled(promptGeneration);
 			}
@@ -1356,8 +1365,8 @@ export class AgentSession {
 					this.isStreaming ? options?.streamingBehavior : undefined,
 				);
 				if (inputResult.action === "handled") {
-					if (admittedGeneration !== undefined && this._lifecycleState === "preflighting") {
-						this._lifecycleState = "idle";
+					if (admittedGeneration !== undefined) {
+						this._restoreIdleAfterPreflight(admittedGeneration);
 					}
 					preflightResult?.(true);
 					return;
@@ -1375,8 +1384,9 @@ export class AgentSession {
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
 
-			// If streaming, queue via steer() or followUp() based on option
-			if (admittedGeneration === undefined && this.isStreaming) {
+			// A prompt that entered while another generation owned admission remains queue-only,
+			// even if asynchronous input handlers outlive that owner's preflight.
+			if (admittedGeneration === undefined) {
 				if (!options?.streamingBehavior) {
 					throw new Error(
 						"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
@@ -1469,8 +1479,8 @@ export class AgentSession {
 				this.agent.state.systemPrompt = this._baseSystemPrompt;
 			}
 		} catch (error) {
-			if (admittedGeneration !== undefined && this._lifecycleState === "preflighting") {
-				this._lifecycleState = "idle";
+			if (admittedGeneration !== undefined) {
+				this._restoreIdleAfterPreflight(admittedGeneration);
 			}
 			preflightResult?.(false);
 			throw error;
@@ -1668,7 +1678,7 @@ export class AgentSession {
 				this.agent.steer(appMessage);
 			}
 		} else if (options?.triggerTurn) {
-			await this._runAgentPrompt(appMessage);
+			await this._runAgentPrompt(appMessage, ++this._promptGeneration);
 		} else {
 			this.agent.state.messages.push(appMessage);
 			this.sessionManager.appendCustomMessageEntry(
