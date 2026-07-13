@@ -58,6 +58,13 @@ import type {
 	SessionEntry,
 	SessionManager,
 } from "../session-manager.ts";
+import type {
+	JsonValue,
+	ScheduleSettledOperationRequest,
+	SessionOperationAcceptance,
+	SessionOperationMetadata,
+	SettledOperationRegistration,
+} from "../session-operation.ts";
 import type { SlashCommandInfo } from "../slash-commands.ts";
 import type { SourceInfo } from "../source-info.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
@@ -339,6 +346,9 @@ export interface ExtensionContext {
  * Includes session control methods only safe in user-initiated commands.
  */
 export interface ExtensionCommandContext extends ExtensionContext {
+	/** Core-authored metadata when a settled operation invoked this command. */
+	readonly operation?: SessionOperationMetadata;
+
 	/** Get the current base system-prompt construction options. */
 	getSystemPromptOptions(): BuildSystemPromptOptions;
 
@@ -548,9 +558,11 @@ export interface ResourcesDiscoverResult {
 export interface SessionStartEvent {
 	type: "session_start";
 	/** Why this session start happened. */
-	reason: "startup" | "reload" | "new" | "resume" | "fork";
-	/** Previously active session file. Present for "new", "resume", and "fork". */
+	reason: "startup" | "reload" | "new" | "resume" | "fork" | "rollback";
+	/** Previously active session file. Present for replacements and rollback. */
 	previousSessionFile?: string;
+	/** Automatic operation responsible for this session start, when applicable. */
+	readonly operation?: SessionOperationMetadata;
 }
 
 /** Fired when the current session metadata changes. */
@@ -565,6 +577,8 @@ export interface SessionBeforeSwitchEvent {
 	type: "session_before_switch";
 	reason: "new" | "resume";
 	targetSessionFile?: string;
+	/** Automatic operation requesting this switch, when applicable. */
+	readonly operation?: SessionOperationMetadata;
 }
 
 /** Fired before forking a session (can be cancelled) */
@@ -572,6 +586,8 @@ export interface SessionBeforeForkEvent {
 	type: "session_before_fork";
 	entryId: string;
 	position: "before" | "at";
+	/** Automatic operation requesting this fork, when applicable. */
+	readonly operation?: SessionOperationMetadata;
 }
 
 /** Fired before context compaction (can be cancelled or customized) */
@@ -601,9 +617,11 @@ export interface SessionCompactEvent {
 /** Fired before an extension runtime is torn down due to quit, reload, or session replacement. */
 export interface SessionShutdownEvent {
 	type: "session_shutdown";
-	reason: "quit" | "reload" | "new" | "resume" | "fork";
+	reason: "quit" | "reload" | "new" | "resume" | "fork" | "rollback";
 	/** Destination session file when shutting down due to session replacement. */
 	targetSessionFile?: string;
+	/** Automatic operation responsible for this shutdown, when applicable. */
+	readonly operation?: SessionOperationMetadata;
 }
 
 /** Preparation data for tree navigation */
@@ -1223,6 +1241,17 @@ export interface ExtensionAPI {
 	// Command, Shortcut, Flag Registration
 	// =========================================================================
 
+	/** Register an out-of-band operation that may run after an agent run fully settles. */
+	registerSettledOperation<TInput extends JsonValue = JsonValue>(
+		name: string,
+		registration: SettledOperationRegistration<TInput>,
+	): void;
+
+	/** Schedule a registered operation without adding model-visible input. */
+	scheduleSettledOperation<TInput extends JsonValue = JsonValue>(
+		request: ScheduleSettledOperationRequest<TInput>,
+	): SessionOperationAcceptance;
+
 	/** Register a custom command. */
 	registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void;
 
@@ -1539,6 +1568,11 @@ export type SetThinkingLevelHandler = (level: ThinkingLevel) => void;
 
 export type SetLabelHandler = (entryId: string, label: string | undefined) => void;
 
+export type ScheduleSettledOperationHandler = (
+	ownerPath: string,
+	request: ScheduleSettledOperationRequest,
+) => SessionOperationAcceptance;
+
 /**
  * Shared state created by loader, used during registration and runtime.
  * Contains flag values (defaults set during registration, CLI values set after).
@@ -1547,9 +1581,13 @@ export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
 	/** Provider registrations queued during extension loading, processed when runner binds */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; extensionPath: string }>;
-	/** Throws when this extension instance is stale after runtime replacement. */
+	/** Throws when this extension instance is suspended or stale. */
 	assertActive: () => void;
-	/** Marks this extension instance as stale after runtime replacement or reload. */
+	/** Temporarily rejects activity while a replacement transaction is unresolved. */
+	suspend: (message?: string) => void;
+	/** Re-enables a suspended runtime after source rollback. */
+	resume: () => void;
+	/** Marks this extension instance as permanently stale after replacement or reload. */
 	invalidate: (message?: string) => void;
 	/**
 	 * Register or unregister a provider.
@@ -1580,6 +1618,7 @@ export interface ExtensionActions {
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
 	setThinkingLevel: SetThinkingLevelHandler;
+	scheduleSettledOperation?: ScheduleSettledOperationHandler;
 }
 
 /**
@@ -1606,14 +1645,18 @@ export interface ExtensionContextActions {
  */
 export interface ExtensionCommandContextActions {
 	waitForIdle: () => Promise<void>;
-	newSession: (options?: {
-		parentSession?: string;
-		setup?: (sessionManager: SessionManager) => Promise<void>;
-		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
-	}) => Promise<{ cancelled: boolean }>;
+	newSession: (
+		options?: {
+			parentSession?: string;
+			setup?: (sessionManager: SessionManager) => Promise<void>;
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+		},
+		operation?: SessionOperationMetadata,
+	) => Promise<{ cancelled: boolean }>;
 	fork: (
 		entryId: string,
 		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+		operation?: SessionOperationMetadata,
 	) => Promise<{ cancelled: boolean }>;
 	navigateTree: (
 		targetId: string,
@@ -1622,6 +1665,7 @@ export interface ExtensionCommandContextActions {
 	switchSession: (
 		sessionPath: string,
 		options?: { withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+		operation?: SessionOperationMetadata,
 	) => Promise<{ cancelled: boolean }>;
 	reload: () => Promise<void>;
 }
@@ -1630,7 +1674,9 @@ export interface ExtensionCommandContextActions {
  * Full runtime = state + actions.
  * Created by loader with throwing action stubs, completed by runner.initialize().
  */
-export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {}
+export interface ExtensionRuntime extends ExtensionRuntimeState, Omit<ExtensionActions, "scheduleSettledOperation"> {
+	scheduleSettledOperation: ScheduleSettledOperationHandler;
+}
 
 /** Loaded extension with all registered items. */
 export interface Extension {
@@ -1642,6 +1688,7 @@ export interface Extension {
 	messageRenderers: Map<string, MessageRenderer>;
 	entryRenderers?: Map<string, EntryRenderer>;
 	commands: Map<string, RegisteredCommand>;
+	settledOperations?: Map<string, SettledOperationRegistration>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
 }

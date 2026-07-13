@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
@@ -22,6 +23,7 @@ import { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import type { BuildSystemPromptOptions } from "../src/core/system-prompt.ts";
+import { createHarness, getUserTexts } from "./suite/harness.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
 
 // Mock stream that mimics AssistantMessageEventStream
@@ -61,8 +63,10 @@ function createAssistantMessage(text: string): AssistantMessage {
 describe("AgentSession concurrent prompt guard", () => {
 	let session: AgentSession;
 	let tempDir: string;
+	let cleanupHarness: (() => void) | undefined;
 
 	beforeEach(() => {
+		cleanupHarness = undefined;
 		tempDir = join(tmpdir(), `pi-concurrent-test-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });
 	});
@@ -70,6 +74,7 @@ describe("AgentSession concurrent prompt guard", () => {
 	afterEach(async () => {
 		delete (globalThis as typeof globalThis & { testExtensionApi?: unknown }).testExtensionApi;
 		delete (globalThis as typeof globalThis & { testCommandRuns?: unknown }).testCommandRuns;
+		cleanupHarness?.();
 		if (session) {
 			session.dispose();
 		}
@@ -147,6 +152,84 @@ describe("AgentSession concurrent prompt guard", () => {
 		// Cleanup
 		await session.abort();
 		await firstPrompt.catch(() => {}); // Ignore abort error
+	});
+
+	it("keeps B queue-only when A is handled during B input preflight and C is admitted", async () => {
+		let markAStarted = () => {};
+		const aStarted = new Promise<void>((resolve) => {
+			markAStarted = resolve;
+		});
+		let releaseA = () => {};
+		const aReleased = new Promise<void>((resolve) => {
+			releaseA = resolve;
+		});
+		let markBStarted = () => {};
+		const bStarted = new Promise<void>((resolve) => {
+			markBStarted = resolve;
+		});
+		let releaseB = () => {};
+		const bReleased = new Promise<void>((resolve) => {
+			releaseB = resolve;
+		});
+		let markCStarted = () => {};
+		const cStarted = new Promise<void>((resolve) => {
+			markCStarted = resolve;
+		});
+		let releaseC = () => {};
+		const cReleased = new Promise<void>((resolve) => {
+			releaseC = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async (event) => {
+						if (event.text === "A") {
+							markAStarted();
+							await aReleased;
+							return { action: "handled" };
+						}
+						if (event.text === "B") {
+							markBStarted();
+							await bReleased;
+						}
+						if (event.text === "C") {
+							markCStarted();
+							await cReleased;
+						}
+					});
+				},
+			],
+		});
+		session = harness.session;
+		cleanupHarness = harness.cleanup;
+		harness.setResponses([fauxAssistantMessage("C done")]);
+
+		const promptA = session.prompt("A");
+		await aStarted;
+		const promptB = session.prompt("B");
+		await bStarted;
+		const idleAfterA = session.waitForIdle();
+
+		releaseA();
+		await Promise.all([promptA, idleAfterA]);
+		expect(session.isIdle).toBe(true);
+
+		const promptC = session.prompt("C");
+		await cStarted;
+		expect(session.isStreaming).toBe(true);
+
+		const promptBRejected = expect(promptB).rejects.toThrow(
+			"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+		);
+		releaseB();
+		await promptBRejected;
+		expect(session.isStreaming).toBe(true);
+
+		releaseC();
+		await promptC;
+
+		expect(getUserTexts(harness)).toEqual(["C"]);
+		expect(session.isIdle).toBe(true);
 	});
 
 	it("should allow steer() while streaming", async () => {

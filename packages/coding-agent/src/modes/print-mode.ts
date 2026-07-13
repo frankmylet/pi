@@ -8,6 +8,7 @@
 
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
+import type { SessionStartEvent } from "../core/extensions/index.ts";
 import { flushRawStdout, writeRawStdout } from "../core/output-guard.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
 
@@ -64,41 +65,47 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 	registerSignalHandlers();
 
-	runtimeHost.setRebindSession(async () => {
-		await rebindSession();
+	runtimeHost.setRebindSession(async (nextSession, sessionStartEvent) => {
+		await rebindSession(nextSession, sessionStartEvent);
 	});
 
-	const rebindSession = async (): Promise<void> => {
-		session = runtimeHost.session;
-		await session.bindExtensions({
-			mode: mode === "json" ? "json" : "print",
-			commandContextActions: {
-				waitForIdle: () => session.waitForIdle(),
-				newSession: async (newSessionOptions) => runtimeHost.newSession(newSessionOptions),
-				fork: async (entryId, forkOptions) => {
-					const result = await runtimeHost.fork(entryId, forkOptions);
-					return { cancelled: result.cancelled };
+	const rebindSession = async (
+		nextSession = runtimeHost.session,
+		sessionStartEvent?: SessionStartEvent,
+	): Promise<void> => {
+		session = nextSession;
+		await session.bindExtensions(
+			{
+				mode: mode === "json" ? "json" : "print",
+				commandContextActions: {
+					waitForIdle: () => session.waitForIdle(),
+					newSession: async (newSessionOptions, operation) => runtimeHost.newSession(newSessionOptions, operation),
+					fork: async (entryId, forkOptions, operation) => {
+						const result = await runtimeHost.fork(entryId, forkOptions, operation);
+						return { cancelled: result.cancelled };
+					},
+					navigateTree: async (targetId, navigateOptions) => {
+						const result = await session.navigateTree(targetId, {
+							summarize: navigateOptions?.summarize,
+							customInstructions: navigateOptions?.customInstructions,
+							replaceInstructions: navigateOptions?.replaceInstructions,
+							label: navigateOptions?.label,
+						});
+						return { cancelled: result.cancelled };
+					},
+					switchSession: async (sessionPath, switchOptions, operation) => {
+						return runtimeHost.switchSession(sessionPath, switchOptions, operation);
+					},
+					reload: async () => {
+						await session.reload();
+					},
 				},
-				navigateTree: async (targetId, navigateOptions) => {
-					const result = await session.navigateTree(targetId, {
-						summarize: navigateOptions?.summarize,
-						customInstructions: navigateOptions?.customInstructions,
-						replaceInstructions: navigateOptions?.replaceInstructions,
-						label: navigateOptions?.label,
-					});
-					return { cancelled: result.cancelled };
-				},
-				switchSession: async (sessionPath, switchOptions) => {
-					return runtimeHost.switchSession(sessionPath, switchOptions);
-				},
-				reload: async () => {
-					await session.reload();
+				onError: (err) => {
+					console.error(`Extension error (${err.extensionPath}): ${err.error}`);
 				},
 			},
-			onError: (err) => {
-				console.error(`Extension error (${err.extensionPath}): ${err.error}`);
-			},
-		});
+			sessionStartEvent,
+		);
 
 		unsubscribe?.();
 		unsubscribe = session.subscribe((event) => {

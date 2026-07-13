@@ -17,6 +17,7 @@ import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
+	SessionStartEvent,
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
 import {
@@ -309,45 +310,56 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		},
 	});
 
-	runtimeHost.setRebindSession(async () => {
-		await rebindSession();
+	runtimeHost.setRebindSession(async (nextSession, sessionStartEvent) => {
+		await rebindSession(nextSession, sessionStartEvent);
 	});
 
-	const rebindSession = async (): Promise<void> => {
-		session = runtimeHost.session;
-		await session.bindExtensions({
-			uiContext: createExtensionUIContext(),
-			mode: "rpc",
-			commandContextActions: {
-				waitForIdle: () => session.waitForIdle(),
-				newSession: async (options) => runtimeHost.newSession(options),
-				fork: async (entryId, forkOptions) => {
-					const result = await runtimeHost.fork(entryId, forkOptions);
-					return { cancelled: result.cancelled };
+	const rebindSession = async (
+		nextSession = runtimeHost.session,
+		sessionStartEvent?: SessionStartEvent,
+	): Promise<void> => {
+		session = nextSession;
+		await session.bindExtensions(
+			{
+				uiContext: createExtensionUIContext(),
+				mode: "rpc",
+				commandContextActions: {
+					waitForIdle: () => session.waitForIdle(),
+					newSession: async (options, operation) => runtimeHost.newSession(options, operation),
+					fork: async (entryId, forkOptions, operation) => {
+						const result = await runtimeHost.fork(entryId, forkOptions, operation);
+						return { cancelled: result.cancelled };
+					},
+					navigateTree: async (targetId, options) => {
+						const result = await session.navigateTree(targetId, {
+							summarize: options?.summarize,
+							customInstructions: options?.customInstructions,
+							replaceInstructions: options?.replaceInstructions,
+							label: options?.label,
+						});
+						return { cancelled: result.cancelled };
+					},
+					switchSession: async (sessionPath, options, operation) => {
+						return runtimeHost.switchSession(sessionPath, options, operation);
+					},
+					reload: async () => {
+						await session.reload();
+					},
 				},
-				navigateTree: async (targetId, options) => {
-					const result = await session.navigateTree(targetId, {
-						summarize: options?.summarize,
-						customInstructions: options?.customInstructions,
-						replaceInstructions: options?.replaceInstructions,
-						label: options?.label,
+				shutdownHandler: () => {
+					shutdownRequested = true;
+				},
+				onError: (err) => {
+					output({
+						type: "extension_error",
+						extensionPath: err.extensionPath,
+						event: err.event,
+						error: err.error,
 					});
-					return { cancelled: result.cancelled };
-				},
-				switchSession: async (sessionPath, options) => {
-					return runtimeHost.switchSession(sessionPath, options);
-				},
-				reload: async () => {
-					await session.reload();
 				},
 			},
-			shutdownHandler: () => {
-				shutdownRequested = true;
-			},
-			onError: (err) => {
-				output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
-			},
-		});
+			sessionStartEvent,
+		);
 
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
@@ -391,25 +403,26 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			// =================================================================
 
 			case "prompt": {
-				// Start prompt handling immediately, but emit the authoritative response only after
-				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
+				// Session selection and prompt initiation are atomic with replacement, but the
+				// admission lock is released while the model turn itself runs.
 				let preflightSucceeded = false;
-				void session
-					.prompt(command.message, {
-						images: command.images,
-						streamingBehavior: command.streamingBehavior,
-						source: "rpc",
-						preflightResult: (didSucceed) => {
-							if (didSucceed) {
-								preflightSucceeded = true;
-								output(success(id, "prompt"));
-							}
-						},
-					})
+				void runtimeHost
+					.startPromptOperation((targetSession, releaseAfterPreflight) =>
+						targetSession.prompt(command.message, {
+							images: command.images,
+							streamingBehavior: command.streamingBehavior,
+							source: "rpc",
+							preflightResult: (didSucceed) => {
+								releaseAfterPreflight();
+								if (didSucceed) {
+									preflightSucceeded = true;
+									output(success(id, "prompt"));
+								}
+							},
+						}),
+					)
 					.catch((e) => {
-						if (!preflightSucceeded) {
-							output(error(id, "prompt", e.message));
-						}
+						if (!preflightSucceeded) output(error(id, "prompt", e.message));
 					});
 				return undefined;
 			}
@@ -425,16 +438,17 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			}
 
 			case "abort": {
-				await session.abort();
+				if (runtimeHost.isSessionReplacementInProgress) {
+					await runtimeHost.cancelSessionReplacement("Session replacement cancelled by RPC abort");
+				} else {
+					await runtimeHost.runExclusiveSessionOperation((targetSession) => targetSession.abort());
+				}
 				return success(id, "abort");
 			}
 
 			case "new_session": {
 				const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
 				const result = await runtimeHost.newSession(options);
-				if (!result.cancelled) {
-					await rebindSession();
-				}
 				return success(id, "new_session", result);
 			}
 
@@ -578,29 +592,20 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 			case "switch_session": {
 				const result = await runtimeHost.switchSession(command.sessionPath);
-				if (!result.cancelled) {
-					await rebindSession();
-				}
 				return success(id, "switch_session", result);
 			}
 
 			case "fork": {
 				const result = await runtimeHost.fork(command.entryId);
-				if (!result.cancelled) {
-					await rebindSession();
-				}
 				return success(id, "fork", { text: result.selectedText, cancelled: result.cancelled });
 			}
 
 			case "clone": {
-				const leafId = session.sessionManager.getLeafId();
-				if (!leafId) {
-					return error(id, "clone", "Cannot clone session: no current entry selected");
-				}
+				const leafId = await runtimeHost.startSessionOperation((targetSession) =>
+					targetSession.sessionManager.getLeafId(),
+				);
+				if (!leafId) return error(id, "clone", "Cannot clone session: no current entry selected");
 				const result = await runtimeHost.fork(leafId, { position: "at" });
-				if (!result.cancelled) {
-					await rebindSession();
-				}
 				return success(id, "clone", { cancelled: result.cancelled });
 			}
 

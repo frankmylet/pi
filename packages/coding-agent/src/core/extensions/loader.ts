@@ -27,6 +27,7 @@ import { resolvePath } from "../../utils/paths.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
+import type { SettledOperationRegistration } from "../session-operation.ts";
 import { createSyntheticSourceInfo } from "../source-info.ts";
 import { time } from "../timings.ts";
 import type {
@@ -161,11 +162,10 @@ export function createExtensionRuntime(): ExtensionRuntime {
 	const notInitialized = () => {
 		throw new Error("Extension runtime not initialized. Action methods cannot be called during extension loading.");
 	};
-	const state: { staleMessage?: string } = {};
+	const state: { staleMessage?: string; suspendedMessage?: string } = {};
 	const assertActive = () => {
-		if (state.staleMessage) {
-			throw new Error(state.staleMessage);
-		}
+		if (state.staleMessage) throw new Error(state.staleMessage);
+		if (state.suspendedMessage) throw new Error(state.suspendedMessage);
 	};
 
 	const runtime: ExtensionRuntime = {
@@ -184,13 +184,23 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		setModel: () => Promise.reject(new Error("Extension runtime not initialized")),
 		getThinkingLevel: notInitialized,
 		setThinkingLevel: notInitialized,
+		scheduleSettledOperation: notInitialized,
 		flagValues: new Map(),
 		pendingProviderRegistrations: [],
 		assertActive,
+		suspend: (message) => {
+			if (!state.staleMessage) {
+				state.suspendedMessage = message ?? "This extension runtime is suspended during session replacement.";
+			}
+		},
+		resume: () => {
+			if (!state.staleMessage) state.suspendedMessage = undefined;
+		},
 		invalidate: (message) => {
 			state.staleMessage ??=
 				message ??
 				"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().";
+			state.suspendedMessage = undefined;
 		},
 		// Pre-bind: queue registrations so bindCore() can flush them once the
 		// model registry is available. bindCore() replaces both with direct calls.
@@ -232,6 +242,29 @@ function createExtensionAPI(
 				sourceInfo: extension.sourceInfo,
 			});
 			runtime.refreshTools();
+		},
+
+		registerSettledOperation(name, registration): void {
+			runtime.assertActive();
+			if (typeof name !== "string" || name.trim().length === 0 || name.length > 128) {
+				throw new Error("Settled operation name must be non-empty and at most 128 characters");
+			}
+			if (typeof registration?.handler !== "function") {
+				throw new Error(`Settled operation ${name} must define a handler`);
+			}
+			if (!extension.settledOperations) {
+				extension.settledOperations = new Map();
+			}
+			const settledOperations = extension.settledOperations;
+			if (settledOperations.has(name)) {
+				throw new Error(`Settled operation already registered: ${name}`);
+			}
+			settledOperations.set(name, registration as SettledOperationRegistration);
+		},
+
+		scheduleSettledOperation(request) {
+			runtime.assertActive();
+			return runtime.scheduleSettledOperation(extension.path, request);
 		},
 
 		registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void {
@@ -364,7 +397,19 @@ function createExtensionAPI(
 			runtime.unregisterProvider(name, extension.path);
 		},
 
-		events: eventBus,
+		events: {
+			emit(channel: string, data: unknown): void {
+				runtime.assertActive();
+				eventBus.emit(channel, data);
+			},
+			on(channel: string, handler: (data: unknown) => void): () => void {
+				runtime.assertActive();
+				return eventBus.on(channel, (data) => {
+					runtime.assertActive();
+					return handler(data);
+				});
+			},
+		},
 	} as ExtensionAPI;
 
 	return api;
@@ -424,6 +469,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		messageRenderers: new Map(),
 		entryRenderers: new Map(),
 		commands: new Map(),
+		settledOperations: new Map(),
 		flags: new Map(),
 		shortcuts: new Map(),
 	};

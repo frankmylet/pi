@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type {
@@ -88,6 +89,15 @@ import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
+import {
+	cloneSessionOperationMetadata,
+	createSessionOperationMetadata,
+	type JsonValue,
+	type ScheduleSettledOperationRequest,
+	type SessionOperationAcceptance,
+	type SessionOperationMetadata,
+	type SettledOperationResult,
+} from "./session-operation.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -154,6 +164,24 @@ export type AgentSessionEvent =
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
+
+interface SettledOperationSource {
+	sessionId: string;
+	sessionFile: string | undefined;
+	cwd: string;
+	leafId: string | null;
+}
+
+interface QueuedSettledOperation {
+	ownerPath: string;
+	name: string;
+	input: JsonValue;
+	operation: SessionOperationMetadata;
+	source: SettledOperationSource;
+	promptGeneration: number;
+	extensionGeneration: number;
+	controller: AbortController;
+}
 
 // ============================================================================
 // Types
@@ -276,7 +304,17 @@ export class AgentSession {
 	// Event subscription state
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
-	private _isAgentRunActive = false;
+	private _lifecycleState: "idle" | "preflighting" | "running" | "settling" | "settled_control" | "disposed" = "idle";
+	private _promptGeneration = 0;
+	private _activePromptGeneration = 0;
+	private _extensionGeneration = 0;
+	private _settledOperationQueue: QueuedSettledOperation[] = [];
+	private _activeSettledOperations = new Set<QueuedSettledOperation>();
+	private _settledOperationIds = new Set<string>();
+	private _settledOperationDedupeKeys = new Set<string>();
+	private _abortedPromptGenerations = new Set<number>();
+	private _isDrainingSettledOperations = false;
+	private _isReloadingExtensions = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
@@ -521,8 +559,12 @@ export class AgentSession {
 		return this._idleWaitPromise;
 	}
 
+	private _isDisposed(): boolean {
+		return this._lifecycleState === "disposed";
+	}
+
 	private _resolveIdleWaitIfIdle(): void {
-		if (this._isAgentRunActive || !this._resolveIdleWait) {
+		if (!this.isIdle || !this._resolveIdleWait) {
 			return;
 		}
 		const resolve = this._resolveIdleWait;
@@ -531,12 +573,35 @@ export class AgentSession {
 		resolve();
 	}
 
-	private async _emitAgentSettled(): Promise<void> {
-		this._isAgentRunActive = false;
+	private _restoreIdleAfterPreflight(promptGeneration: number): void {
+		if (this._activePromptGeneration !== promptGeneration || this._lifecycleState !== "preflighting") {
+			return;
+		}
+		this._abortedPromptGenerations.delete(promptGeneration);
+		this._lifecycleState = "idle";
+		this._resolveIdleWaitIfIdle();
+	}
+
+	private async _emitAgentSettled(promptGeneration: number): Promise<void> {
+		if (this._lifecycleState === "disposed") {
+			this._abortedPromptGenerations.delete(promptGeneration);
+			this._resolveIdleWaitIfIdle();
+			return;
+		}
+		if (this._activePromptGeneration !== promptGeneration || this._lifecycleState !== "settling") {
+			return;
+		}
+		this._lifecycleState = "settled_control";
 		try {
 			await this._extensionRunner.emit({ type: "agent_settled" });
+			if (this._isDisposed()) return;
 			this._emit({ type: "agent_settled" });
+			await this._drainSettledOperations(promptGeneration);
 		} finally {
+			this._abortedPromptGenerations.delete(promptGeneration);
+			if (this._activePromptGeneration === promptGeneration && this._lifecycleState === "settled_control") {
+				this._lifecycleState = "idle";
+			}
 			this._resolveIdleWaitIfIdle();
 		}
 	}
@@ -792,11 +857,23 @@ export class AgentSession {
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 	}
 
+	/** Temporarily reject captured extension activity during a replacement transaction. */
+	suspendExtensionsForReplacement(): void {
+		this._extensionRunner.suspend();
+	}
+
+	/** Re-enable extension activity when a replacement transaction rolls back. */
+	resumeExtensionsAfterReplacement(): void {
+		this._extensionRunner.resume();
+	}
+
 	/**
 	 * Remove all listeners and disconnect from agent.
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._lifecycleState = "disposed";
+		this._cancelSettledOperations();
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -812,6 +889,7 @@ export class AgentSession {
 		);
 		this._disconnectFromAgent();
 		this._eventListeners = [];
+		this._resolveIdleWaitIfIdle();
 		cleanupSessionResources(this.sessionId);
 	}
 
@@ -836,12 +914,20 @@ export class AgentSession {
 
 	/** Whether the session is currently processing an agent run or post-run continuation. */
 	get isStreaming(): boolean {
-		return this._isAgentRunActive;
+		return (
+			this._lifecycleState === "preflighting" ||
+			this._lifecycleState === "running" ||
+			this._lifecycleState === "settling"
+		);
 	}
 
 	/** Whether the session has no active agent run, retry, auto-compaction, or queued continuation. */
 	get isIdle(): boolean {
-		return !this._isAgentRunActive;
+		return (
+			this._lifecycleState === "idle" ||
+			this._lifecycleState === "settled_control" ||
+			this._lifecycleState === "disposed"
+		);
 	}
 
 	/** Current effective system prompt (includes any per-turn extension modifications) */
@@ -1017,11 +1103,222 @@ export class AgentSession {
 	}
 
 	// =========================================================================
-	// Prompting
+	// Settled operations and prompting
 	// =========================================================================
 
-	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
-		this._isAgentRunActive = true;
+	private _hasPendingSettledWork(): boolean {
+		return (
+			this.agent.hasQueuedMessages() ||
+			this._steeringMessages.length > 0 ||
+			this._followUpMessages.length > 0 ||
+			this._pendingNextTurnMessages.length > 0 ||
+			this._pendingBashMessages.length > 0 ||
+			this._retryAbortController !== undefined ||
+			this._compactionAbortController !== undefined ||
+			this._autoCompactionAbortController !== undefined ||
+			this._branchSummaryAbortController !== undefined ||
+			this._bashAbortController !== undefined ||
+			this._lifecycleState === "preflighting" ||
+			this._lifecycleState === "running" ||
+			this._lifecycleState === "settling"
+		);
+	}
+
+	private _scheduleSettledOperation(
+		ownerPath: string,
+		request: ScheduleSettledOperationRequest,
+	): SessionOperationAcceptance {
+		if (this._lifecycleState === "disposed") {
+			return { accepted: false, code: "disposed" };
+		}
+		if (this._isReloadingExtensions) {
+			return { accepted: false, code: "stale_source" };
+		}
+		if (
+			!request ||
+			typeof request.name !== "string" ||
+			request.name.trim().length === 0 ||
+			request.name.length > 128 ||
+			(request.dedupeKey !== undefined &&
+				(typeof request.dedupeKey !== "string" ||
+					request.dedupeKey.trim().length === 0 ||
+					request.dedupeKey.length > 256))
+		) {
+			return { accepted: false, code: "invalid_request" };
+		}
+		let input: JsonValue;
+		try {
+			const serialized = JSON.stringify(request.input);
+			if (serialized === undefined) {
+				return { accepted: false, code: "invalid_request" };
+			}
+			input = JSON.parse(serialized) as JsonValue;
+		} catch {
+			return { accepted: false, code: "invalid_request" };
+		}
+		if (!this._extensionRunner.getSettledOperation(ownerPath, request.name)) {
+			return { accepted: false, code: "unknown_operation" };
+		}
+		if (
+			this._isDrainingSettledOperations ||
+			(this._lifecycleState !== "running" &&
+				this._lifecycleState !== "settling" &&
+				this._lifecycleState !== "settled_control")
+		) {
+			return { accepted: false, code: "not_settling" };
+		}
+		if (this._abortedPromptGenerations.has(this._activePromptGeneration)) {
+			return { accepted: false, code: "aborted" };
+		}
+
+		const extension = this._extensionRunner.getExtensionSource(ownerPath);
+		if (!extension) {
+			return { accepted: false, code: "unknown_operation" };
+		}
+		if (request.dedupeKey !== undefined) {
+			const dedupeKey = `${this.sessionId}\0${this._extensionGeneration}\0${ownerPath}\0${request.name}\0${request.dedupeKey}`;
+			if (this._settledOperationDedupeKeys.has(dedupeKey)) {
+				return { accepted: false, code: "duplicate" };
+			}
+			this._settledOperationDedupeKeys.add(dedupeKey);
+		}
+		let operationId: string;
+		do {
+			operationId = randomUUID();
+		} while (this._settledOperationIds.has(operationId));
+		this._settledOperationIds.add(operationId);
+
+		const operation = createSessionOperationMetadata(operationId, ownerPath, request.name, extension);
+		this._settledOperationQueue.push({
+			ownerPath,
+			name: request.name,
+			input,
+			operation,
+			source: {
+				sessionId: this.sessionId,
+				sessionFile: this.sessionFile,
+				cwd: this.sessionManager.getCwd(),
+				leafId: this.sessionManager.getLeafId(),
+			},
+			promptGeneration: this._activePromptGeneration,
+			extensionGeneration: this._extensionGeneration,
+			controller: new AbortController(),
+		});
+		return Object.freeze({ accepted: true, operation: cloneSessionOperationMetadata(operation) });
+	}
+
+	private _cancelSettledOperations(): void {
+		for (const operation of this._settledOperationQueue.splice(0)) {
+			operation.controller.abort();
+		}
+		for (const operation of this._activeSettledOperations) {
+			operation.controller.abort();
+		}
+	}
+
+	private async _drainSettledOperations(promptGeneration: number): Promise<void> {
+		const queued = this._settledOperationQueue.splice(0);
+		this._isDrainingSettledOperations = true;
+		try {
+			for (const operation of queued) {
+				const currentSource = {
+					sessionId: this.sessionId,
+					sessionFile: this.sessionFile,
+					cwd: this.sessionManager.getCwd(),
+					leafId: this.sessionManager.getLeafId(),
+				};
+				if (
+					this._lifecycleState === "disposed" ||
+					this._isReloadingExtensions ||
+					operation.controller.signal.aborted ||
+					operation.promptGeneration !== promptGeneration ||
+					this._promptGeneration !== promptGeneration ||
+					operation.extensionGeneration !== this._extensionGeneration ||
+					operation.source.sessionId !== currentSource.sessionId ||
+					operation.source.sessionFile !== currentSource.sessionFile ||
+					operation.source.cwd !== currentSource.cwd ||
+					operation.source.leafId !== currentSource.leafId ||
+					this._hasPendingSettledWork()
+				) {
+					operation.controller.abort();
+					continue;
+				}
+				const registration = this._extensionRunner.getSettledOperation(operation.ownerPath, operation.name);
+				if (!registration) {
+					operation.controller.abort();
+					continue;
+				}
+				this._activeSettledOperations.add(operation);
+				try {
+					const runner = this._extensionRunner;
+					const result = await registration.handler(
+						operation.input,
+						runner.createSettledOperationContext(operation.operation, operation.controller.signal),
+					);
+					if (result !== undefined) {
+						await this._invokeSettledOperationCommand(operation, runner, result);
+					}
+				} catch (error) {
+					if (!operation.controller.signal.aborted) {
+						this._extensionRunner.emitError({
+							extensionPath: operation.ownerPath,
+							event: `settled_operation:${operation.name}`,
+							error: error instanceof Error ? error.message : String(error),
+							stack: error instanceof Error ? error.stack : undefined,
+						});
+					}
+				} finally {
+					this._activeSettledOperations.delete(operation);
+				}
+			}
+		} finally {
+			this._isDrainingSettledOperations = false;
+		}
+	}
+
+	private async _invokeSettledOperationCommand(
+		operation: QueuedSettledOperation,
+		runner: ExtensionRunner,
+		result: SettledOperationResult,
+	): Promise<void> {
+		if (
+			!result ||
+			result.type !== "invoke_command" ||
+			typeof result.command !== "string" ||
+			result.command.trim().length === 0 ||
+			result.command.length > 128 ||
+			(result.args !== undefined && typeof result.args !== "string")
+		) {
+			runner.emitError({
+				extensionPath: operation.ownerPath,
+				event: `settled_operation:${operation.name}`,
+				error: "Settled operation returned an invalid command invocation",
+			});
+			return;
+		}
+		if (
+			this._extensionRunner !== runner ||
+			this._extensionGeneration !== operation.extensionGeneration ||
+			operation.controller.signal.aborted ||
+			this._lifecycleState !== "settled_control" ||
+			this._hasPendingSettledWork()
+		) {
+			operation.controller.abort();
+			return;
+		}
+		await this._executeExtensionCommand(result.command, result.args ?? "", {
+			ownerPath: operation.ownerPath,
+			operation: operation.operation,
+			event: `settled_operation:${operation.name}:command`,
+		});
+	}
+
+	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[], promptGeneration: number): Promise<void> {
+		if (this._lifecycleState === "disposed") {
+			throw new Error("Agent session is disposed");
+		}
+		this._activePromptGeneration = promptGeneration;
+		this._lifecycleState = "running";
 		try {
 			await this.agent.prompt(messages);
 			while (await this._handlePostAgentRun()) {
@@ -1030,7 +1327,13 @@ export class AgentSession {
 		} finally {
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
-			await this._emitAgentSettled();
+			if (this._isDisposed()) {
+				this._abortedPromptGenerations.delete(promptGeneration);
+				this._resolveIdleWaitIfIdle();
+			} else if (this._activePromptGeneration === promptGeneration && this._lifecycleState === "running") {
+				this._lifecycleState = "settling";
+				await this._emitAgentSettled(promptGeneration);
+			}
 		}
 	}
 
@@ -1074,9 +1377,13 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		if (this._lifecycleState === "disposed") {
+			throw new Error("Agent session is disposed");
+		}
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
+		let admittedGeneration: number | undefined;
 
 		try {
 			// Handle extension commands first (execute immediately, even during streaming)
@@ -1090,6 +1397,15 @@ export class AgentSession {
 				}
 			}
 
+			if (this._lifecycleState === "idle" || this._lifecycleState === "settled_control") {
+				if (this._lifecycleState === "settled_control") {
+					this._cancelSettledOperations();
+				}
+				admittedGeneration = ++this._promptGeneration;
+				this._activePromptGeneration = admittedGeneration;
+				this._lifecycleState = "preflighting";
+			}
+
 			// Emit input event for extension interception (before skill/template expansion)
 			let currentText = text;
 			let currentImages = options?.images;
@@ -1098,9 +1414,12 @@ export class AgentSession {
 					currentText,
 					currentImages,
 					options?.source ?? "interactive",
-					this.isStreaming ? options?.streamingBehavior : undefined,
+					admittedGeneration === undefined ? options?.streamingBehavior : undefined,
 				);
 				if (inputResult.action === "handled") {
+					if (admittedGeneration !== undefined) {
+						this._restoreIdleAfterPreflight(admittedGeneration);
+					}
 					preflightResult?.(true);
 					return;
 				}
@@ -1117,8 +1436,9 @@ export class AgentSession {
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
 
-			// If streaming, queue via steer() or followUp() based on option
-			if (this.isStreaming) {
+			// A prompt that entered while another generation owned admission remains queue-only,
+			// even if asynchronous input handlers outlive that owner's preflight.
+			if (admittedGeneration === undefined) {
 				if (!options?.streamingBehavior) {
 					throw new Error(
 						"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
@@ -1211,6 +1531,9 @@ export class AgentSession {
 				this.agent.state.systemPrompt = this._baseSystemPrompt;
 			}
 		} catch (error) {
+			if (admittedGeneration !== undefined) {
+				this._restoreIdleAfterPreflight(admittedGeneration);
+			}
 			preflightResult?.(false);
 			throw error;
 		}
@@ -1220,7 +1543,7 @@ export class AgentSession {
 		}
 
 		preflightResult?.(true);
-		await this._runAgentPrompt(messages);
+		await this._runAgentPrompt(messages, admittedGeneration);
 	}
 
 	/**
@@ -1231,21 +1554,36 @@ export class AgentSession {
 		const spaceIndex = text.indexOf(" ");
 		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
 		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1);
+		return this._executeExtensionCommand(commandName, args);
+	}
 
-		const command = this._extensionRunner.getCommand(commandName);
-		if (!command) return false;
+	private async _executeExtensionCommand(
+		commandName: string,
+		args: string,
+		options?: { ownerPath: string; operation: SessionOperationMetadata; event: string },
+	): Promise<boolean> {
+		const runner = this._extensionRunner;
+		const command = options ? runner.getOwnedCommand(options.ownerPath, commandName) : runner.getCommand(commandName);
+		if (!command) {
+			if (options) {
+				runner.emitError({
+					extensionPath: options.ownerPath,
+					event: options.event,
+					error: `Settled operation cannot invoke unowned or unknown command: ${commandName}`,
+				});
+			}
+			return false;
+		}
 
-		// Get command context from extension runner (includes session control methods)
-		const ctx = this._extensionRunner.createCommandContext();
-
+		// Construct command-only capabilities only after the command has been resolved and authorized.
+		const ctx = runner.createCommandContext(options?.operation);
 		try {
 			await command.handler(args, ctx);
 			return true;
 		} catch (err) {
-			// Emit error via extension runner
-			this._extensionRunner.emitError({
-				extensionPath: `command:${commandName}`,
-				event: "command",
+			(options ? runner : this._extensionRunner).emitError({
+				extensionPath: options?.ownerPath ?? `command:${commandName}`,
+				event: options?.event ?? "command",
 				error: err instanceof Error ? err.message : String(err),
 			});
 			return true;
@@ -1407,7 +1745,7 @@ export class AgentSession {
 				this.agent.steer(appMessage);
 			}
 		} else if (options?.triggerTurn) {
-			await this._runAgentPrompt(appMessage);
+			await this._runAgentPrompt(appMessage, ++this._promptGeneration);
 		} else {
 			this.agent.state.messages.push(appMessage);
 			this.sessionManager.appendCustomMessageEntry(
@@ -1499,6 +1837,8 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		this._abortedPromptGenerations.add(this._activePromptGeneration);
+		this._cancelSettledOperations();
 		this.abortRetry();
 		this.agent.abort();
 		await this.waitForIdle();
@@ -2173,7 +2513,7 @@ export class AgentSession {
 		return this.settingsManager.getCompactionEnabled();
 	}
 
-	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
+	async bindExtensions(bindings: ExtensionBindings, sessionStartEvent = this._sessionStartEvent): Promise<void> {
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
 		}
@@ -2194,8 +2534,8 @@ export class AgentSession {
 		}
 
 		this._applyExtensionBindings(this._extensionRunner);
-		await this._extensionRunner.emit(this._sessionStartEvent);
-		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+		await this._extensionRunner.emit(sessionStartEvent);
+		await this.extendResourcesFromExtensions(sessionStartEvent.reason === "reload" ? "reload" : "startup");
 	}
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
@@ -2349,6 +2689,7 @@ export class AgentSession {
 				},
 				getThinkingLevel: () => this.thinkingLevel,
 				setThinkingLevel: (level) => this.setThinkingLevel(level),
+				scheduleSettledOperation: (ownerPath, request) => this._scheduleSettledOperation(ownerPath, request),
 			},
 			{
 				getModel: () => this.model,
@@ -2356,6 +2697,8 @@ export class AgentSession {
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 				getSignal: () => this.agent.signal,
 				abort: () => {
+					this._abortedPromptGenerations.add(this._activePromptGeneration);
+					this._cancelSettledOperations();
 					if (this._extensionAbortHandler) {
 						this._extensionAbortHandler();
 						return;
@@ -2542,27 +2885,40 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
-		const previousFlagValues = this._extensionRunner.getFlagValues();
-		await emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason: "reload" });
-		await this.settingsManager.reload();
-		this.syncQueueModesFromSettings();
-		resetApiProviders();
-		await this._resourceLoader.reload();
-		this._buildRuntime({
-			activeToolNames: this.getActiveToolNames(),
-			flagValues: previousFlagValues,
-			includeAllExtensionTools: true,
-		});
+		this._cancelSettledOperations();
+		this._isReloadingExtensions = true;
+		try {
+			const previousRunner = this._extensionRunner;
+			const previousFlagValues = previousRunner.getFlagValues();
+			await emitSessionShutdownEvent(previousRunner, { type: "session_shutdown", reason: "reload" });
+			previousRunner.invalidate();
+			this._extensionGeneration++;
+			// Accepted IDs and dedupe keys are retained for one extension generation only.
+			// Clearing after invalidation prevents old APIs from reopening a duplicate in the new generation.
+			this._settledOperationIds.clear();
+			this._settledOperationDedupeKeys.clear();
+			await this.settingsManager.reload();
+			this.syncQueueModesFromSettings();
+			resetApiProviders();
+			await this._resourceLoader.reload();
+			this._buildRuntime({
+				activeToolNames: this.getActiveToolNames(),
+				flagValues: previousFlagValues,
+				includeAllExtensionTools: true,
+			});
 
-		const hasBindings =
-			this._extensionUIContext ||
-			this._extensionCommandContextActions ||
-			this._extensionShutdownHandler ||
-			this._extensionErrorListener;
-		if (hasBindings) {
-			await options?.beforeSessionStart?.();
-			await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
-			await this.extendResourcesFromExtensions("reload");
+			const hasBindings =
+				this._extensionUIContext ||
+				this._extensionCommandContextActions ||
+				this._extensionShutdownHandler ||
+				this._extensionErrorListener;
+			if (hasBindings) {
+				await options?.beforeSessionStart?.();
+				await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
+				await this.extendResourcesFromExtensions("reload");
+			}
+		} finally {
+			this._isReloadingExtensions = false;
 		}
 	}
 

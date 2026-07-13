@@ -10,6 +10,13 @@ import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { SessionManager } from "../session-manager.ts";
+import {
+	cloneSessionOperationMetadata,
+	type JsonValue,
+	type SessionOperationMetadata,
+	type SettledOperationContext,
+	type SettledOperationRegistration,
+} from "../session-operation.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
 import type {
 	BeforeAgentStartEvent,
@@ -158,15 +165,19 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 
 export type ExtensionErrorListener = (error: ExtensionError) => void;
 
-export type NewSessionHandler = (options?: {
-	parentSession?: string;
-	setup?: (sessionManager: SessionManager) => Promise<void>;
-	withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
-}) => Promise<{ cancelled: boolean }>;
+export type NewSessionHandler = (
+	options?: {
+		parentSession?: string;
+		setup?: (sessionManager: SessionManager) => Promise<void>;
+		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+	},
+	operation?: SessionOperationMetadata,
+) => Promise<{ cancelled: boolean }>;
 
 export type ForkHandler = (
 	entryId: string,
 	options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+	operation?: SessionOperationMetadata,
 ) => Promise<{ cancelled: boolean }>;
 
 export type NavigateTreeHandler = (
@@ -177,6 +188,7 @@ export type NavigateTreeHandler = (
 export type SwitchSessionHandler = (
 	sessionPath: string,
 	options?: { withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+	operation?: SessionOperationMetadata,
 ) => Promise<{ cancelled: boolean }>;
 
 export type ReloadHandler = () => Promise<void>;
@@ -292,6 +304,7 @@ export class ExtensionRunner {
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private staleMessage: string | undefined;
+	private suspendedMessage: string | undefined;
 
 	constructor(
 		extensions: Extension[],
@@ -331,6 +344,8 @@ export class ExtensionRunner {
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
+		this.runtime.scheduleSettledOperation =
+			actions.scheduleSettledOperation ?? (() => ({ accepted: false, code: "not_settling" }));
 
 		// Context actions (required)
 		this.getModel = contextActions.getModel;
@@ -416,6 +431,10 @@ export class ExtensionRunner {
 
 	getExtensionPaths(): string[] {
 		return this.extensions.map((e) => e.path);
+	}
+
+	getExtensionSource(extensionPath: string): Extension["sourceInfo"] | undefined {
+		return this.extensions.find((extension) => extension.path === extensionPath)?.sourceInfo;
 	}
 
 	/** Get all registered tools from all extensions (first registration per name wins). */
@@ -511,19 +530,31 @@ export class ExtensionRunner {
 		return this.shortcutDiagnostics;
 	}
 
+	suspend(message = "This extension runtime is suspended while session replacement is unresolved."): void {
+		if (this.staleMessage) return;
+		this.suspendedMessage = message;
+		this.runtime.suspend(message);
+	}
+
+	resume(): void {
+		if (this.staleMessage) return;
+		this.suspendedMessage = undefined;
+		this.runtime.resume();
+	}
+
 	invalidate(
 		message = "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 	): void {
 		if (!this.staleMessage) {
 			this.staleMessage = message;
+			this.suspendedMessage = undefined;
 			this.runtime.invalidate(message);
 		}
 	}
 
 	private assertActive(): void {
-		if (this.staleMessage) {
-			throw new Error(this.staleMessage);
-		}
+		if (this.staleMessage) throw new Error(this.staleMessage);
+		if (this.suspendedMessage) throw new Error(this.suspendedMessage);
 	}
 
 	onError(listener: ExtensionErrorListener): () => void {
@@ -616,6 +647,34 @@ export class ExtensionRunner {
 		return this.resolveRegisteredCommands().find((command) => command.invocationName === name);
 	}
 
+	getOwnedCommand(ownerPath: string, name: string): ResolvedCommand | undefined {
+		const registration = this.extensions.find((extension) => extension.path === ownerPath)?.commands.get(name);
+		if (!registration) return undefined;
+		return this.resolveRegisteredCommands().find(
+			(command) => command.handler === registration.handler && command.sourceInfo === registration.sourceInfo,
+		);
+	}
+
+	getSettledOperation(ownerPath: string, name: string): SettledOperationRegistration<JsonValue> | undefined {
+		return this.extensions.find((extension) => extension.path === ownerPath)?.settledOperations?.get(name);
+	}
+
+	createSettledOperationContext(metadata: SessionOperationMetadata, signal: AbortSignal): SettledOperationContext {
+		const context = Object.defineProperties(
+			{},
+			Object.getOwnPropertyDescriptors(this.createContext()),
+		) as SettledOperationContext;
+		Object.defineProperty(context, "operation", {
+			enumerable: true,
+			value: cloneSessionOperationMetadata(metadata),
+		});
+		Object.defineProperty(context, "signal", {
+			enumerable: true,
+			value: signal,
+		});
+		return context;
+	}
+
 	/**
 	 * Request a graceful shutdown. Called by extension tools and event handlers.
 	 * The actual shutdown behavior is provided by the mode via bindExtensions().
@@ -704,7 +763,7 @@ export class ExtensionRunner {
 		};
 	}
 
-	createCommandContext(): ExtensionCommandContext {
+	createCommandContext(operation?: SessionOperationMetadata): ExtensionCommandContext {
 		// Use property descriptors instead of object spread so the guarded getters from
 		// createContext() stay lazy. A spread would eagerly read them once and freeze the
 		// old values into the returned object, bypassing stale-instance checks.
@@ -712,6 +771,12 @@ export class ExtensionRunner {
 			{},
 			Object.getOwnPropertyDescriptors(this.createContext()),
 		) as ExtensionCommandContext;
+		if (operation) {
+			Object.defineProperty(context, "operation", {
+				enumerable: true,
+				value: cloneSessionOperationMetadata(operation),
+			});
+		}
 		context.getSystemPromptOptions = () => {
 			this.assertActive();
 			return this.getSystemPromptOptionsFn();
@@ -722,11 +787,11 @@ export class ExtensionRunner {
 		};
 		context.newSession = (options) => {
 			this.assertActive();
-			return this.newSessionHandler(options);
+			return operation ? this.newSessionHandler(options, operation) : this.newSessionHandler(options);
 		};
 		context.fork = (entryId, options) => {
 			this.assertActive();
-			return this.forkHandler(entryId, options);
+			return operation ? this.forkHandler(entryId, options, operation) : this.forkHandler(entryId, options);
 		};
 		context.navigateTree = (targetId, options) => {
 			this.assertActive();
@@ -734,7 +799,9 @@ export class ExtensionRunner {
 		};
 		context.switchSession = (sessionPath, options) => {
 			this.assertActive();
-			return this.switchSessionHandler(sessionPath, options);
+			return operation
+				? this.switchSessionHandler(sessionPath, options, operation)
+				: this.switchSessionHandler(sessionPath, options);
 		};
 		context.reload = () => {
 			this.assertActive();
