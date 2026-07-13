@@ -77,6 +77,7 @@ import type {
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
 	ProjectTrustContext,
+	SessionStartEvent,
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
@@ -154,7 +155,6 @@ import {
 	getThemeByName,
 	onThemeChange,
 	setRegisteredThemes,
-	stopThemeWatcher,
 	Theme,
 	type ThemeColor,
 	theme,
@@ -470,8 +470,8 @@ export class InteractiveMode {
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
 			this.resetExtensionUI();
 		});
-		this.runtimeHost.setRebindSession(async () => {
-			await this.rebindCurrentSession({ renderBeforeBind: true });
+		this.runtimeHost.setRebindSession(async (_nextSession, sessionStartEvent) => {
+			await this.rebindCurrentSession({ renderBeforeBind: true, sessionStartEvent });
 		});
 		this.version = VERSION;
 		this.ui = new TUI(new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
@@ -914,7 +914,9 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
-				await this.session.prompt(userInput);
+				await this.runtimeHost.startPromptOperation((targetSession, releaseAfterPreflight) =>
+					targetSession.prompt(userInput, { preflightResult: releaseAfterPreflight }),
+				);
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
@@ -1621,73 +1623,68 @@ export class InteractiveMode {
 	/**
 	 * Initialize the extension system with TUI-based UI context.
 	 */
-	private async bindCurrentSessionExtensions(): Promise<void> {
+	private async bindCurrentSessionExtensions(sessionStartEvent?: SessionStartEvent): Promise<void> {
 		const uiContext = this.createExtensionUIContext();
-		await this.session.bindExtensions({
-			uiContext,
-			mode: "tui",
-			abortHandler: () => {
-				this.restoreQueuedMessagesToEditor({ abort: true });
-			},
-			commandContextActions: {
-				waitForIdle: () => this.session.waitForIdle(),
-				newSession: async (options, operation) => {
-					this.clearStatusIndicator();
-					try {
-						return await this.runtimeHost.newSession(options, operation);
-					} catch (error: unknown) {
-						return this.handleFatalRuntimeError("Failed to create session", error);
-					}
+		await this.session.bindExtensions(
+			{
+				uiContext,
+				mode: "tui",
+				abortHandler: () => {
+					this.restoreQueuedMessagesToEditor({ abort: true });
 				},
-				fork: async (entryId, options, operation) => {
-					try {
+				commandContextActions: {
+					waitForIdle: () => this.session.waitForIdle(),
+					newSession: async (options, operation) => {
+						this.clearStatusIndicator();
+						return this.runtimeHost.newSession(options, operation);
+					},
+					fork: async (entryId, options, operation) => {
 						const result = await this.runtimeHost.fork(entryId, options, operation);
 						if (!result.cancelled) {
 							this.editor.setText(result.selectedText ?? "");
 							this.showStatus("Forked to new session");
 						}
 						return { cancelled: result.cancelled };
-					} catch (error: unknown) {
-						return this.handleFatalRuntimeError("Failed to fork session", error);
-					}
-				},
-				navigateTree: async (targetId, options) => {
-					const result = await this.session.navigateTree(targetId, {
-						summarize: options?.summarize,
-						customInstructions: options?.customInstructions,
-						replaceInstructions: options?.replaceInstructions,
-						label: options?.label,
-					});
-					if (result.cancelled) {
-						return { cancelled: true };
-					}
+					},
+					navigateTree: async (targetId, options) => {
+						const result = await this.session.navigateTree(targetId, {
+							summarize: options?.summarize,
+							customInstructions: options?.customInstructions,
+							replaceInstructions: options?.replaceInstructions,
+							label: options?.label,
+						});
+						if (result.cancelled) {
+							return { cancelled: true };
+						}
 
-					this.chatContainer.clear();
-					this.renderInitialMessages();
-					if (result.editorText && !this.editor.getText().trim()) {
-						this.editor.setText(result.editorText);
+						this.chatContainer.clear();
+						this.renderInitialMessages();
+						if (result.editorText && !this.editor.getText().trim()) {
+							this.editor.setText(result.editorText);
+						}
+						this.showStatus("Navigated to selected point");
+						void this.flushCompactionQueue({ willRetry: false });
+						return { cancelled: false };
+					},
+					switchSession: async (sessionPath, options, operation) => {
+						return this.handleResumeSession(sessionPath, options, operation);
+					},
+					reload: async () => {
+						await this.handleReloadCommand();
+					},
+				},
+				shutdownHandler: () => {
+					this.shutdownRequested = true;
+					if (this.session.isIdle) {
+						void this.shutdown();
 					}
-					this.showStatus("Navigated to selected point");
-					void this.flushCompactionQueue({ willRetry: false });
-					return { cancelled: false };
 				},
-				switchSession: async (sessionPath, options, operation) => {
-					return this.handleResumeSession(sessionPath, options, operation);
-				},
-				reload: async () => {
-					await this.handleReloadCommand();
+				onError: (error) => {
+					this.showExtensionError(error.extensionPath, error.error, error.stack);
 				},
 			},
-			shutdownHandler: () => {
-				this.shutdownRequested = true;
-				if (this.session.isIdle) {
-					void this.shutdown();
-				}
-			},
-			onError: (error) => {
-				this.showExtensionError(error.extensionPath, error.error, error.stack);
-			},
-		});
+			sessionStartEvent,
+		);
 
 		setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
 		this.setupAutocompleteProvider();
@@ -1721,29 +1718,23 @@ export class InteractiveMode {
 		}
 	}
 
-	private async rebindCurrentSession(options: { renderBeforeBind?: boolean } = {}): Promise<void> {
+	private async rebindCurrentSession(
+		options: { renderBeforeBind?: boolean; sessionStartEvent?: SessionStartEvent } = {},
+	): Promise<void> {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		this.applyRuntimeSettings();
 		if (options.renderBeforeBind) {
 			this.renderCurrentSessionState();
 			this.subscribeToAgent();
-			await this.bindCurrentSessionExtensions();
+			await this.bindCurrentSessionExtensions(options.sessionStartEvent);
 		} else {
-			await this.bindCurrentSessionExtensions();
+			await this.bindCurrentSessionExtensions(options.sessionStartEvent);
 			this.subscribeToAgent();
 		}
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
-	}
-
-	private async handleFatalRuntimeError(prefix: string, error: unknown): Promise<never> {
-		const message = error instanceof Error ? error.message : String(error);
-		this.showError(`${prefix}: ${message}`);
-		stopThemeWatcher();
-		this.stop();
-		process.exit(1);
 	}
 
 	private renderCurrentSessionState(): void {
@@ -2738,7 +2729,7 @@ export class InteractiveMode {
 			}
 			if (text === "/reload") {
 				this.editor.setText("");
-				await this.handleReloadCommand();
+				await this.runtimeHost.runExclusiveSessionOperation(() => this.handleReloadCommand());
 				return;
 			}
 			if (text === "/debug") {
@@ -3967,14 +3958,18 @@ export class InteractiveMode {
 		}
 	}
 
+	private abortAgentOrReplacement(): void {
+		if (!this.runtimeHost.requestSessionReplacementCancellation("Session replacement cancelled by user")) {
+			this.agent.abort();
+		}
+	}
+
 	private restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
 		const { steering, followUp } = this.clearAllQueues();
 		const allQueued = [...steering, ...followUp];
 		if (allQueued.length === 0) {
 			this.updatePendingMessagesDisplay();
-			if (options?.abort) {
-				this.agent.abort();
-			}
+			if (options?.abort) this.abortAgentOrReplacement();
 			return 0;
 		}
 		const queuedText = allQueued.join("\n\n");
@@ -3982,9 +3977,7 @@ export class InteractiveMode {
 		const combinedText = [queuedText, currentText].filter((t) => t.trim()).join("\n\n");
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
-		if (options?.abort) {
-			this.agent.abort();
-		}
+		if (options?.abort) this.abortAgentOrReplacement();
 		return allQueued.length;
 	}
 
@@ -4810,7 +4803,8 @@ export class InteractiveMode {
 				this.showStatus("Resumed session in current cwd");
 				return result;
 			}
-			return this.handleFatalRuntimeError("Failed to resume session", error);
+			this.showError(`Failed to resume session: ${error instanceof Error ? error.message : String(error)}`);
+			return { cancelled: true };
 		}
 	}
 
@@ -5475,7 +5469,7 @@ export class InteractiveMode {
 				this.showError(`Failed to import session: ${error.message}`);
 				return;
 			}
-			await this.handleFatalRuntimeError("Failed to import session", error);
+			this.showError(`Failed to import session: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 
@@ -5851,7 +5845,7 @@ export class InteractiveMode {
 			this.chatContainer.addChild(new Text(`${theme.fg("accent", "✓ New session started")}`, 1, 1));
 			this.ui.requestRender();
 		} catch (error: unknown) {
-			await this.handleFatalRuntimeError("Failed to create session", error);
+			this.showError(`Failed to create session: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 

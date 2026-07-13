@@ -1434,6 +1434,22 @@ export class SessionManager {
 	}
 
 	/**
+	 * Clone an in-memory manager so a replacement can be prepared without mutating
+	 * the source runtime. The clone retains the current tree and leaf but receives
+	 * independent entry/index state.
+	 */
+	cloneInMemory(): SessionManager {
+		const clone = SessionManager.inMemory(this.cwd);
+		clone.sessionId = this.sessionId;
+		clone.sessionFile = undefined;
+		clone.sessionDir = this.sessionDir;
+		clone.fileEntries = structuredClone(this.fileEntries);
+		clone.flushed = false;
+		clone._buildIndex();
+		return clone;
+	}
+
+	/**
 	 * Create a new session.
 	 * @param cwd Working directory (stored in session header)
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.pi/agent/sessions/<encoded-cwd>/).

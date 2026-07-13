@@ -558,8 +558,8 @@ export interface ResourcesDiscoverResult {
 export interface SessionStartEvent {
 	type: "session_start";
 	/** Why this session start happened. */
-	reason: "startup" | "reload" | "new" | "resume" | "fork";
-	/** Previously active session file. Present for "new", "resume", and "fork". */
+	reason: "startup" | "reload" | "new" | "resume" | "fork" | "rollback";
+	/** Previously active session file. Present for replacements and rollback. */
 	previousSessionFile?: string;
 	/** Automatic operation responsible for this session start, when applicable. */
 	readonly operation?: SessionOperationMetadata;
@@ -617,7 +617,7 @@ export interface SessionCompactEvent {
 /** Fired before an extension runtime is torn down due to quit, reload, or session replacement. */
 export interface SessionShutdownEvent {
 	type: "session_shutdown";
-	reason: "quit" | "reload" | "new" | "resume" | "fork";
+	reason: "quit" | "reload" | "new" | "resume" | "fork" | "rollback";
 	/** Destination session file when shutting down due to session replacement. */
 	targetSessionFile?: string;
 	/** Automatic operation responsible for this shutdown, when applicable. */
@@ -1581,9 +1581,13 @@ export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
 	/** Provider registrations queued during extension loading, processed when runner binds */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; extensionPath: string }>;
-	/** Throws when this extension instance is stale after runtime replacement. */
+	/** Throws when this extension instance is suspended or stale. */
 	assertActive: () => void;
-	/** Marks this extension instance as stale after runtime replacement or reload. */
+	/** Temporarily rejects activity while a replacement transaction is unresolved. */
+	suspend: (message?: string) => void;
+	/** Re-enables a suspended runtime after source rollback. */
+	resume: () => void;
+	/** Marks this extension instance as permanently stale after replacement or reload. */
 	invalidate: (message?: string) => void;
 	/**
 	 * Register or unregister a provider.

@@ -145,6 +145,12 @@ function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: number
 
 	const runtimeHost = {
 		session,
+		isSessionReplacementInProgress: false,
+		startSessionOperation: async <T>(start: (target: AgentSession) => T) => start(session),
+		startPromptOperation: async (start: (target: AgentSession, release: () => void) => Promise<void>) =>
+			start(session, () => {}),
+		runExclusiveSessionOperation: async <T>(run: (target: AgentSession) => T | Promise<T>) => run(session),
+		cancelSessionReplacement: vi.fn(async () => false),
 		newSession: vi.fn(async () => ({ cancelled: true })),
 		switchSession: vi.fn(async () => ({ cancelled: true })),
 		fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),

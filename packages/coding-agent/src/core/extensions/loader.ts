@@ -162,11 +162,10 @@ export function createExtensionRuntime(): ExtensionRuntime {
 	const notInitialized = () => {
 		throw new Error("Extension runtime not initialized. Action methods cannot be called during extension loading.");
 	};
-	const state: { staleMessage?: string } = {};
+	const state: { staleMessage?: string; suspendedMessage?: string } = {};
 	const assertActive = () => {
-		if (state.staleMessage) {
-			throw new Error(state.staleMessage);
-		}
+		if (state.staleMessage) throw new Error(state.staleMessage);
+		if (state.suspendedMessage) throw new Error(state.suspendedMessage);
 	};
 
 	const runtime: ExtensionRuntime = {
@@ -189,10 +188,19 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		flagValues: new Map(),
 		pendingProviderRegistrations: [],
 		assertActive,
+		suspend: (message) => {
+			if (!state.staleMessage) {
+				state.suspendedMessage = message ?? "This extension runtime is suspended during session replacement.";
+			}
+		},
+		resume: () => {
+			if (!state.staleMessage) state.suspendedMessage = undefined;
+		},
 		invalidate: (message) => {
 			state.staleMessage ??=
 				message ??
 				"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().";
+			state.suspendedMessage = undefined;
 		},
 		// Pre-bind: queue registrations so bindCore() can flush them once the
 		// model registry is available. bindCore() replaces both with direct calls.
@@ -389,7 +397,19 @@ function createExtensionAPI(
 			runtime.unregisterProvider(name, extension.path);
 		},
 
-		events: eventBus,
+		events: {
+			emit(channel: string, data: unknown): void {
+				runtime.assertActive();
+				eventBus.emit(channel, data);
+			},
+			on(channel: string, handler: (data: unknown) => void): () => void {
+				runtime.assertActive();
+				return eventBus.on(channel, (data) => {
+					runtime.assertActive();
+					return handler(data);
+				});
+			},
+		},
 	} as ExtensionAPI;
 
 	return api;

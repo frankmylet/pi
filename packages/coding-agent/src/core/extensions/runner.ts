@@ -304,6 +304,7 @@ export class ExtensionRunner {
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private staleMessage: string | undefined;
+	private suspendedMessage: string | undefined;
 
 	constructor(
 		extensions: Extension[],
@@ -529,19 +530,31 @@ export class ExtensionRunner {
 		return this.shortcutDiagnostics;
 	}
 
+	suspend(message = "This extension runtime is suspended while session replacement is unresolved."): void {
+		if (this.staleMessage) return;
+		this.suspendedMessage = message;
+		this.runtime.suspend(message);
+	}
+
+	resume(): void {
+		if (this.staleMessage) return;
+		this.suspendedMessage = undefined;
+		this.runtime.resume();
+	}
+
 	invalidate(
 		message = "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 	): void {
 		if (!this.staleMessage) {
 			this.staleMessage = message;
+			this.suspendedMessage = undefined;
 			this.runtime.invalidate(message);
 		}
 	}
 
 	private assertActive(): void {
-		if (this.staleMessage) {
-			throw new Error(this.staleMessage);
-		}
+		if (this.staleMessage) throw new Error(this.staleMessage);
+		if (this.suspendedMessage) throw new Error(this.suspendedMessage);
 	}
 
 	onError(listener: ExtensionErrorListener): () => void {

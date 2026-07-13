@@ -857,6 +857,16 @@ export class AgentSession {
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 	}
 
+	/** Temporarily reject captured extension activity during a replacement transaction. */
+	suspendExtensionsForReplacement(): void {
+		this._extensionRunner.suspend();
+	}
+
+	/** Re-enable extension activity when a replacement transaction rolls back. */
+	resumeExtensionsAfterReplacement(): void {
+		this._extensionRunner.resume();
+	}
+
 	/**
 	 * Remove all listeners and disconnect from agent.
 	 * Call this when completely done with the session.
@@ -1404,7 +1414,7 @@ export class AgentSession {
 					currentText,
 					currentImages,
 					options?.source ?? "interactive",
-					this.isStreaming ? options?.streamingBehavior : undefined,
+					admittedGeneration === undefined ? options?.streamingBehavior : undefined,
 				);
 				if (inputResult.action === "handled") {
 					if (admittedGeneration !== undefined) {
@@ -2503,7 +2513,7 @@ export class AgentSession {
 		return this.settingsManager.getCompactionEnabled();
 	}
 
-	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
+	async bindExtensions(bindings: ExtensionBindings, sessionStartEvent = this._sessionStartEvent): Promise<void> {
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
 		}
@@ -2524,8 +2534,8 @@ export class AgentSession {
 		}
 
 		this._applyExtensionBindings(this._extensionRunner);
-		await this._extensionRunner.emit(this._sessionStartEvent);
-		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+		await this._extensionRunner.emit(sessionStartEvent);
+		await this.extendResourcesFromExtensions(sessionStartEvent.reason === "reload" ? "reload" : "startup");
 	}
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
