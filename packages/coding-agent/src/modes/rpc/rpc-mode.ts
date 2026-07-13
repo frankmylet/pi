@@ -320,9 +320,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			mode: "rpc",
 			commandContextActions: {
 				waitForIdle: () => session.waitForIdle(),
-				newSession: async (options) => runtimeHost.newSession(options),
-				fork: async (entryId, forkOptions) => {
-					const result = await runtimeHost.fork(entryId, forkOptions);
+				newSession: async (options, operation) => runtimeHost.newSession(options, operation),
+				fork: async (entryId, forkOptions, operation) => {
+					const result = await runtimeHost.fork(entryId, forkOptions, operation);
 					return { cancelled: result.cancelled };
 				},
 				navigateTree: async (targetId, options) => {
@@ -334,8 +334,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					});
 					return { cancelled: result.cancelled };
 				},
-				switchSession: async (sessionPath, options) => {
-					return runtimeHost.switchSession(sessionPath, options);
+				switchSession: async (sessionPath, options, operation) => {
+					return runtimeHost.switchSession(sessionPath, options, operation);
 				},
 				reload: async () => {
 					await session.reload();

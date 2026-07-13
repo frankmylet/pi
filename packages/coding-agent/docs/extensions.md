@@ -397,6 +397,7 @@ Fired when a session is started, loaded, or reloaded.
 pi.on("session_start", async (event, ctx) => {
   // event.reason - "startup" | "reload" | "new" | "resume" | "fork"
   // event.previousSessionFile - present for "new", "resume", and "fork"
+  // event.operation - core-authored metadata for automatic command-driven replacement
   ctx.ui.notify(`Session: ${ctx.sessionManager.getSessionFile() ?? "ephemeral"}`, "info");
 });
 ```
@@ -420,6 +421,7 @@ Fired before starting a new session (`/new`) or switching sessions (`/resume`).
 pi.on("session_before_switch", async (event, ctx) => {
   // event.reason - "new" or "resume"
   // event.targetSessionFile - session we're switching to (only for "resume")
+  // event.operation - core-authored metadata for automatic command-driven replacement
 
   if (event.reason === "new") {
     const ok = await ctx.ui.confirm("Clear?", "Delete all messages?");
@@ -439,6 +441,7 @@ Fired when forking via `/fork` or cloning via `/clone`.
 pi.on("session_before_fork", async (event, ctx) => {
   // event.entryId - ID of the selected entry
   // event.position - "before" for /fork, "at" for /clone
+  // event.operation - core-authored metadata for automatic command-driven replacement
   return { cancel: true }; // Cancel fork/clone
   // OR
   return { skipConversationRestore: true }; // Reserved for future conversation restore control
@@ -505,6 +508,7 @@ Fired before a started session runtime is torn down. Use this to clean up resour
 pi.on("session_shutdown", async (event, ctx) => {
   // event.reason - "quit" | "reload" | "new" | "resume" | "fork"
   // event.targetSessionFile - destination session for session replacement flows
+  // event.operation - core-authored metadata for automatic command-driven replacement
   // Cleanup, save state, etc.
 });
 ```
@@ -567,11 +571,20 @@ pi.on("agent_settled", async (_event, ctx) => {
 Extensions can register out-of-band work for Pi to drain after every `agent_settled` handler and the public settled event have finished:
 
 ```typescript
+pi.registerCommand("rotate-session", {
+  handler: async (snapshot, ctx) => {
+    await ctx.newSession({ parentSession: ctx.sessionManager.getSessionFile() });
+  },
+});
+
 pi.registerSettledOperation<{ snapshot: string }>("persist-snapshot", {
   handler: async (input, ctx) => {
     // ctx is a fresh ExtensionContext plus core-authored operation metadata
     // and a signal that aborts on reload, disposal, or superseding work.
     await persistSnapshot(input.snapshot, ctx.signal);
+
+    // Optionally continue through a command owned by this same extension.
+    return { type: "invoke_command", command: "rotate-session", args: input.snapshot };
   },
 });
 
@@ -588,7 +601,9 @@ pi.on("agent_settled", () => {
 
 Inputs must be JSON-serializable. A `dedupeKey` is scoped to the owning extension registration and current session extension generation. Scheduling is immediate; do not await terminal work from `agent_settled`. Pi resolves the owning registration again at drain time and cancels work on duplicate keys, source drift, abort, reload, disposal, or a newer admitted prompt. The operation context deliberately excludes command-only methods such as `newSession`, `switchSession`, and `fork`.
 
-Settled operations are control work, not model input. Do not invoke them through slash commands, `sendUserMessage()`, synthetic prompts, or captured command contexts.
+A handler may return `{ type: "invoke_command", command, args? }`. After the handler settles, Pi resolves the command again from the same extension and runtime generation, then invokes it once with a fresh `ExtensionCommandContext`. Commands from another extension and built-in commands are not eligible. The command context exposes the immutable core-authored metadata as `ctx.operation`; if it calls `newSession`, `switchSession`, or `fork`, the same metadata is attached to the relevant before-switch/fork, shutdown, and start events. Command errors use the extension error channel and do not stop later settled operations.
+
+Settled operations are control work, not model input. The declarative command result does not add slash text or a user/model message. Do not invoke settled control through `sendUserMessage()`, synthetic prompts, or captured command contexts.
 
 #### turn_start / turn_end
 
@@ -1097,7 +1112,7 @@ pi.on("before_agent_start", (event, ctx) => {
 
 ## ExtensionCommandContext
 
-Command handlers receive `ExtensionCommandContext`, which extends `ExtensionContext` with session control methods. These are only available in commands because they can deadlock if called from event handlers.
+Command handlers receive `ExtensionCommandContext`, which extends `ExtensionContext` with session control methods. These are only available in commands because they can deadlock if called from event handlers. `ctx.operation` is present only when a settled operation declaratively invoked the command; it contains immutable, core-authored correlation metadata.
 
 ### ctx.getSystemPromptOptions()
 

@@ -62,6 +62,7 @@ import type {
 	JsonValue,
 	ScheduleSettledOperationRequest,
 	SessionOperationAcceptance,
+	SessionOperationMetadata,
 	SettledOperationRegistration,
 } from "../session-operation.ts";
 import type { SlashCommandInfo } from "../slash-commands.ts";
@@ -345,6 +346,9 @@ export interface ExtensionContext {
  * Includes session control methods only safe in user-initiated commands.
  */
 export interface ExtensionCommandContext extends ExtensionContext {
+	/** Core-authored metadata when a settled operation invoked this command. */
+	readonly operation?: SessionOperationMetadata;
+
 	/** Get the current base system-prompt construction options. */
 	getSystemPromptOptions(): BuildSystemPromptOptions;
 
@@ -557,6 +561,8 @@ export interface SessionStartEvent {
 	reason: "startup" | "reload" | "new" | "resume" | "fork";
 	/** Previously active session file. Present for "new", "resume", and "fork". */
 	previousSessionFile?: string;
+	/** Automatic operation responsible for this session start, when applicable. */
+	readonly operation?: SessionOperationMetadata;
 }
 
 /** Fired when the current session metadata changes. */
@@ -571,6 +577,8 @@ export interface SessionBeforeSwitchEvent {
 	type: "session_before_switch";
 	reason: "new" | "resume";
 	targetSessionFile?: string;
+	/** Automatic operation requesting this switch, when applicable. */
+	readonly operation?: SessionOperationMetadata;
 }
 
 /** Fired before forking a session (can be cancelled) */
@@ -578,6 +586,8 @@ export interface SessionBeforeForkEvent {
 	type: "session_before_fork";
 	entryId: string;
 	position: "before" | "at";
+	/** Automatic operation requesting this fork, when applicable. */
+	readonly operation?: SessionOperationMetadata;
 }
 
 /** Fired before context compaction (can be cancelled or customized) */
@@ -610,6 +620,8 @@ export interface SessionShutdownEvent {
 	reason: "quit" | "reload" | "new" | "resume" | "fork";
 	/** Destination session file when shutting down due to session replacement. */
 	targetSessionFile?: string;
+	/** Automatic operation responsible for this shutdown, when applicable. */
+	readonly operation?: SessionOperationMetadata;
 }
 
 /** Preparation data for tree navigation */
@@ -1629,14 +1641,18 @@ export interface ExtensionContextActions {
  */
 export interface ExtensionCommandContextActions {
 	waitForIdle: () => Promise<void>;
-	newSession: (options?: {
-		parentSession?: string;
-		setup?: (sessionManager: SessionManager) => Promise<void>;
-		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
-	}) => Promise<{ cancelled: boolean }>;
+	newSession: (
+		options?: {
+			parentSession?: string;
+			setup?: (sessionManager: SessionManager) => Promise<void>;
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+		},
+		operation?: SessionOperationMetadata,
+	) => Promise<{ cancelled: boolean }>;
 	fork: (
 		entryId: string,
 		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+		operation?: SessionOperationMetadata,
 	) => Promise<{ cancelled: boolean }>;
 	navigateTree: (
 		targetId: string,
@@ -1645,6 +1661,7 @@ export interface ExtensionCommandContextActions {
 	switchSession: (
 		sessionPath: string,
 		options?: { withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+		operation?: SessionOperationMetadata,
 	) => Promise<{ cancelled: boolean }>;
 	reload: () => Promise<void>;
 }

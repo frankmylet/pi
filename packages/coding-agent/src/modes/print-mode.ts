@@ -74,9 +74,9 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			mode: mode === "json" ? "json" : "print",
 			commandContextActions: {
 				waitForIdle: () => session.waitForIdle(),
-				newSession: async (newSessionOptions) => runtimeHost.newSession(newSessionOptions),
-				fork: async (entryId, forkOptions) => {
-					const result = await runtimeHost.fork(entryId, forkOptions);
+				newSession: async (newSessionOptions, operation) => runtimeHost.newSession(newSessionOptions, operation),
+				fork: async (entryId, forkOptions, operation) => {
+					const result = await runtimeHost.fork(entryId, forkOptions, operation);
 					return { cancelled: result.cancelled };
 				},
 				navigateTree: async (targetId, navigateOptions) => {
@@ -88,8 +88,8 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 					});
 					return { cancelled: result.cancelled };
 				},
-				switchSession: async (sessionPath, switchOptions) => {
-					return runtimeHost.switchSession(sessionPath, switchOptions);
+				switchSession: async (sessionPath, switchOptions, operation) => {
+					return runtimeHost.switchSession(sessionPath, switchOptions, operation);
 				},
 				reload: async () => {
 					await session.reload();

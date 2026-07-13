@@ -50,8 +50,28 @@ export interface SettledOperationContext extends ExtensionContext {
 	readonly signal: AbortSignal;
 }
 
+/** Declarative command invocation requested by a settled-operation handler. */
+export interface SettledOperationCommandInvocation {
+	readonly type: "invoke_command";
+	/** Registration name of a command owned by the same extension. */
+	readonly command: string;
+	/** Raw command arguments, without a slash-command prefix. */
+	readonly args?: string;
+}
+
+export type SettledOperationResult = SettledOperationCommandInvocation;
+
+export type SettledOperationHandler<TInput extends JsonValue = JsonValue> = (
+	input: TInput,
+	ctx: SettledOperationContext,
+) =>
+	| void
+	| SettledOperationResult
+	// biome-ignore lint/suspicious/noConfusingVoidType: async handlers may return no result
+	| Promise<void | SettledOperationResult>;
+
 export interface SettledOperationRegistration<TInput extends JsonValue = JsonValue> {
-	handler: (input: TInput, ctx: SettledOperationContext) => void | Promise<void>;
+	handler: SettledOperationHandler<TInput>;
 }
 
 export interface ScheduleSettledOperationRequest<TInput extends JsonValue = JsonValue> {

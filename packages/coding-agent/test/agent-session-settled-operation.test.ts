@@ -1,6 +1,6 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import type { SessionOperationAcceptance, SettledOperationContext } from "../src/index.ts";
+import type { ExtensionCommandContext, SessionOperationAcceptance, SettledOperationContext } from "../src/index.ts";
 import { createHarness, getUserTexts, type Harness } from "./suite/harness.ts";
 
 describe("settled operations", () => {
@@ -86,6 +86,190 @@ describe("settled operations", () => {
 		expect(operationContext?.operation.origin.extensionPath).toMatch(/^<inline:\d+>$/);
 		expect("newSession" in (operationContext ?? {})).toBe(false);
 		expect(getUserTexts(harness)).toEqual(["hello"]);
+	});
+
+	it("invokes a same-owner command once with a fresh metadata-bearing context after settlement", async () => {
+		const order: string[] = [];
+		let acceptance: SessionOperationAcceptance | undefined;
+		let settledContext: SettledOperationContext | undefined;
+		let commandContext: ExtensionCommandContext | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("automatic", {
+						handler: async (args, ctx) => {
+							order.push(`command:${args}`);
+							commandContext = ctx;
+						},
+					});
+					pi.registerSettledOperation("dispatch", {
+						handler: (_input, ctx) => {
+							order.push("operation");
+							settledContext = ctx;
+							return { type: "invoke_command", command: "automatic", args: "next" };
+						},
+					});
+					pi.on("agent_settled", () => {
+						order.push("handler:first");
+						acceptance = pi.scheduleSettledOperation({ name: "dispatch", input: null });
+					});
+				},
+				(pi) => {
+					pi.registerCommand("automatic", {
+						handler: async () => {
+							order.push("command:wrong-owner");
+						},
+					});
+					pi.on("agent_settled", () => {
+						order.push("handler:second");
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.session.subscribe((event) => {
+			if (event.type === "agent_settled") order.push("public");
+		});
+		harness.setResponses([fauxAssistantMessage("done")]);
+
+		await harness.session.prompt("hello");
+
+		expect(order).toEqual(["handler:first", "handler:second", "public", "operation", "command:next"]);
+		expect(acceptance?.accepted).toBe(true);
+		if (!acceptance?.accepted) throw new Error("operation was not accepted");
+		expect(commandContext).toBeDefined();
+		expect(commandContext).not.toBe(settledContext);
+		expect(commandContext?.operation).toEqual(acceptance.operation);
+		expect(commandContext?.operation).not.toBe(acceptance.operation);
+		expect(Object.isFrozen(commandContext?.operation)).toBe(true);
+		expect("newSession" in (settledContext ?? {})).toBe(false);
+		expect(typeof commandContext?.newSession).toBe("function");
+		expect(getUserTexts(harness)).toEqual(["hello"]);
+	});
+
+	it("blocks commands owned by other extensions and builtins", async () => {
+		let otherCommandRuns = 0;
+		const errors: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					for (const [operationName, command] of [
+						["other", "other-command"],
+						["builtin", "new"],
+					] as const) {
+						pi.registerSettledOperation(operationName, {
+							handler: () => ({ type: "invoke_command", command }),
+						});
+					}
+					pi.on("agent_settled", () => {
+						pi.scheduleSettledOperation({ name: "other", input: null });
+						pi.scheduleSettledOperation({ name: "builtin", input: null });
+					});
+				},
+				(pi) => {
+					pi.registerCommand("other-command", {
+						handler: async () => {
+							otherCommandRuns++;
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({ onError: (error) => errors.push(error.error) });
+		harness.setResponses([fauxAssistantMessage("done")]);
+
+		await harness.session.prompt("hello");
+
+		expect(otherCommandRuns).toBe(0);
+		expect(errors).toEqual([
+			"Settled operation cannot invoke unowned or unknown command: other-command",
+			"Settled operation cannot invoke unowned or unknown command: new",
+		]);
+		expect(getUserTexts(harness)).toEqual(["hello"]);
+	});
+
+	it("drops a command result when reload makes its operation runtime stale", async () => {
+		let commandRuns = 0;
+		let releaseOperation = () => {};
+		const operationReleased = new Promise<void>((resolve) => {
+			releaseOperation = resolve;
+		});
+		let markOperationStarted = () => {};
+		const operationStarted = new Promise<void>((resolve) => {
+			markOperationStarted = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("automatic", {
+						handler: async () => {
+							commandRuns++;
+						},
+					});
+					pi.registerSettledOperation("dispatch", {
+						handler: async () => {
+							markOperationStarted();
+							await operationReleased;
+							return { type: "invoke_command", command: "automatic" };
+						},
+					});
+					pi.on("agent_settled", () => {
+						pi.scheduleSettledOperation({ name: "dispatch", input: null });
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+
+		const prompt = harness.session.prompt("hello");
+		await operationStarted;
+		await harness.session.reload();
+		releaseOperation();
+		await prompt;
+
+		expect(commandRuns).toBe(0);
+		expect(getUserTexts(harness)).toEqual(["hello"]);
+	});
+
+	it("isolates command errors and continues draining later operations", async () => {
+		const commandRuns: string[] = [];
+		const errors: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("fail", {
+						handler: async () => {
+							commandRuns.push("fail");
+							throw new Error("command failed");
+						},
+					});
+					pi.registerCommand("pass", {
+						handler: async () => {
+							commandRuns.push("pass");
+						},
+					});
+					for (const name of ["fail", "pass"] as const) {
+						pi.registerSettledOperation(name, {
+							handler: () => ({ type: "invoke_command", command: name }),
+						});
+					}
+					pi.on("agent_settled", () => {
+						pi.scheduleSettledOperation({ name: "fail", input: null });
+						pi.scheduleSettledOperation({ name: "pass", input: null });
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({ onError: (error) => errors.push(error.error) });
+		harness.setResponses([fauxAssistantMessage("done")]);
+
+		await harness.session.prompt("hello");
+
+		expect(commandRuns).toEqual(["fail", "pass"]);
+		expect(errors).toContain("command failed");
 	});
 
 	it("retains dedupe keys through terminal execution for the extension generation", async () => {

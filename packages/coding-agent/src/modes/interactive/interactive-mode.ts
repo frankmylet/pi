@@ -89,6 +89,7 @@ import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-nam
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import { type SessionEntry, SessionManager, sessionEntryToContextMessages } from "../../core/session-manager.ts";
+import type { SessionOperationMetadata } from "../../core/session-operation.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
@@ -1630,17 +1631,17 @@ export class InteractiveMode {
 			},
 			commandContextActions: {
 				waitForIdle: () => this.session.waitForIdle(),
-				newSession: async (options) => {
+				newSession: async (options, operation) => {
 					this.clearStatusIndicator();
 					try {
-						return await this.runtimeHost.newSession(options);
+						return await this.runtimeHost.newSession(options, operation);
 					} catch (error: unknown) {
 						return this.handleFatalRuntimeError("Failed to create session", error);
 					}
 				},
-				fork: async (entryId, options) => {
+				fork: async (entryId, options, operation) => {
 					try {
-						const result = await this.runtimeHost.fork(entryId, options);
+						const result = await this.runtimeHost.fork(entryId, options, operation);
 						if (!result.cancelled) {
 							this.editor.setText(result.selectedText ?? "");
 							this.showStatus("Forked to new session");
@@ -1670,8 +1671,8 @@ export class InteractiveMode {
 					void this.flushCompactionQueue({ willRetry: false });
 					return { cancelled: false };
 				},
-				switchSession: async (sessionPath, options) => {
-					return this.handleResumeSession(sessionPath, options);
+				switchSession: async (sessionPath, options, operation) => {
+					return this.handleResumeSession(sessionPath, options, operation);
 				},
 				reload: async () => {
 					await this.handleReloadCommand();
@@ -4770,13 +4771,18 @@ export class InteractiveMode {
 	private async handleResumeSession(
 		sessionPath: string,
 		options?: Parameters<ExtensionCommandContext["switchSession"]>[1],
+		operation?: SessionOperationMetadata,
 	): Promise<{ cancelled: boolean }> {
 		this.clearStatusIndicator();
 		try {
-			const result = await this.runtimeHost.switchSession(sessionPath, {
-				withSession: options?.withSession,
-				projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
-			});
+			const result = await this.runtimeHost.switchSession(
+				sessionPath,
+				{
+					withSession: options?.withSession,
+					projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
+				},
+				operation,
+			);
 			if (result.cancelled) {
 				return result;
 			}
@@ -4789,11 +4795,15 @@ export class InteractiveMode {
 					this.showStatus("Resume cancelled");
 					return { cancelled: true };
 				}
-				const result = await this.runtimeHost.switchSession(sessionPath, {
-					cwdOverride: selectedCwd,
-					withSession: options?.withSession,
-					projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
-				});
+				const result = await this.runtimeHost.switchSession(
+					sessionPath,
+					{
+						cwdOverride: selectedCwd,
+						withSession: options?.withSession,
+						projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
+					},
+					operation,
+				);
 				if (result.cancelled) {
 					return result;
 				}

@@ -96,6 +96,7 @@ import {
 	type ScheduleSettledOperationRequest,
 	type SessionOperationAcceptance,
 	type SessionOperationMetadata,
+	type SettledOperationResult,
 } from "./session-operation.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
@@ -1239,10 +1240,14 @@ export class AgentSession {
 				}
 				this._activeSettledOperations.add(operation);
 				try {
-					await registration.handler(
+					const runner = this._extensionRunner;
+					const result = await registration.handler(
 						operation.input,
-						this._extensionRunner.createSettledOperationContext(operation.operation, operation.controller.signal),
+						runner.createSettledOperationContext(operation.operation, operation.controller.signal),
 					);
+					if (result !== undefined) {
+						await this._invokeSettledOperationCommand(operation, runner, result);
+					}
 				} catch (error) {
 					if (!operation.controller.signal.aborted) {
 						this._extensionRunner.emitError({
@@ -1259,6 +1264,43 @@ export class AgentSession {
 		} finally {
 			this._isDrainingSettledOperations = false;
 		}
+	}
+
+	private async _invokeSettledOperationCommand(
+		operation: QueuedSettledOperation,
+		runner: ExtensionRunner,
+		result: SettledOperationResult,
+	): Promise<void> {
+		if (
+			!result ||
+			result.type !== "invoke_command" ||
+			typeof result.command !== "string" ||
+			result.command.trim().length === 0 ||
+			result.command.length > 128 ||
+			(result.args !== undefined && typeof result.args !== "string")
+		) {
+			runner.emitError({
+				extensionPath: operation.ownerPath,
+				event: `settled_operation:${operation.name}`,
+				error: "Settled operation returned an invalid command invocation",
+			});
+			return;
+		}
+		if (
+			this._extensionRunner !== runner ||
+			this._extensionGeneration !== operation.extensionGeneration ||
+			operation.controller.signal.aborted ||
+			this._lifecycleState !== "settled_control" ||
+			this._hasPendingSettledWork()
+		) {
+			operation.controller.abort();
+			return;
+		}
+		await this._executeExtensionCommand(result.command, result.args ?? "", {
+			ownerPath: operation.ownerPath,
+			operation: operation.operation,
+			event: `settled_operation:${operation.name}:command`,
+		});
 	}
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[], promptGeneration: number): Promise<void> {
@@ -1502,21 +1544,36 @@ export class AgentSession {
 		const spaceIndex = text.indexOf(" ");
 		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
 		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1);
+		return this._executeExtensionCommand(commandName, args);
+	}
 
-		const command = this._extensionRunner.getCommand(commandName);
-		if (!command) return false;
+	private async _executeExtensionCommand(
+		commandName: string,
+		args: string,
+		options?: { ownerPath: string; operation: SessionOperationMetadata; event: string },
+	): Promise<boolean> {
+		const runner = this._extensionRunner;
+		const command = options ? runner.getOwnedCommand(options.ownerPath, commandName) : runner.getCommand(commandName);
+		if (!command) {
+			if (options) {
+				runner.emitError({
+					extensionPath: options.ownerPath,
+					event: options.event,
+					error: `Settled operation cannot invoke unowned or unknown command: ${commandName}`,
+				});
+			}
+			return false;
+		}
 
-		// Get command context from extension runner (includes session control methods)
-		const ctx = this._extensionRunner.createCommandContext();
-
+		// Construct command-only capabilities only after the command has been resolved and authorized.
+		const ctx = runner.createCommandContext(options?.operation);
 		try {
 			await command.handler(args, ctx);
 			return true;
 		} catch (err) {
-			// Emit error via extension runner
-			this._extensionRunner.emitError({
-				extensionPath: `command:${commandName}`,
-				event: "command",
+			(options ? runner : this._extensionRunner).emitError({
+				extensionPath: options?.ownerPath ?? `command:${commandName}`,
+				event: options?.event ?? "command",
 				error: err instanceof Error ? err.message : String(err),
 			});
 			return true;

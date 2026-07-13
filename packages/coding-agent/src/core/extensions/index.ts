@@ -9,8 +9,11 @@ export type {
 	SessionOperationAcceptance,
 	SessionOperationMetadata,
 	SessionOperationRejectionCode,
+	SettledOperationCommandInvocation,
 	SettledOperationContext,
+	SettledOperationHandler,
 	SettledOperationRegistration,
+	SettledOperationResult,
 } from "../session-operation.ts";
 export type { SlashCommandInfo, SlashCommandSource } from "../slash-commands.ts";
 export type { SourceInfo } from "../source-info.ts";

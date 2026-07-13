@@ -133,6 +133,65 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		]);
 	});
 
+	it("threads settled-operation metadata through command-driven session replacement", async () => {
+		const events: RecordedSessionEvent[] = [];
+		let commandOperationId: string | undefined;
+		const { runtimeHost } = await createRuntimeHost((pi) => {
+			pi.registerCommand("replace", {
+				handler: async (_args, ctx) => {
+					commandOperationId = ctx.operation?.operationId;
+					await ctx.newSession();
+				},
+			});
+			pi.registerSettledOperation("replace", {
+				handler: () => ({ type: "invoke_command", command: "replace" }),
+			});
+			pi.on("agent_settled", () => {
+				pi.scheduleSettledOperation({ name: "replace", input: null });
+			});
+			pi.on("session_before_switch", (event) => {
+				events.push(event);
+			});
+			pi.on("session_shutdown", (event) => {
+				events.push(event);
+			});
+			pi.on("session_start", (event) => {
+				events.push(event);
+			});
+		});
+		await runtimeHost.session.bindExtensions({
+			commandContextActions: {
+				waitForIdle: () => runtimeHost.session.waitForIdle(),
+				newSession: (options, operation) => runtimeHost.newSession(options, operation),
+				fork: async (entryId, options, operation) => {
+					const result = await runtimeHost.fork(entryId, options, operation);
+					return { cancelled: result.cancelled };
+				},
+				navigateTree: async (targetId, options) => {
+					const result = await runtimeHost.session.navigateTree(targetId, options);
+					return { cancelled: result.cancelled };
+				},
+				switchSession: (sessionPath, options, operation) =>
+					runtimeHost.switchSession(sessionPath, options, operation),
+				reload: () => runtimeHost.session.reload(),
+			},
+		});
+		events.length = 0;
+
+		await runtimeHost.session.prompt("hello");
+		await runtimeHost.session.bindExtensions({});
+
+		expect(commandOperationId).toMatch(/^[0-9a-f-]{36}$/);
+		expect(events).toHaveLength(3);
+		const operations = events.map((event) => event.operation);
+		expect(operations.every((operation) => operation?.operationId === commandOperationId)).toBe(true);
+		expect(operations.every((operation) => Object.isFrozen(operation))).toBe(true);
+		expect(operations[0]).not.toBe(operations[1]);
+		expect(operations[1]).not.toBe(operations[2]);
+		expect(operations[0]?.origin.operationName).toBe("replace");
+		expect(events.map((event) => event.type)).toEqual(["session_before_switch", "session_shutdown", "session_start"]);
+	});
+
 	it("honors session_before_switch cancellation", async () => {
 		const events: RecordedSessionEvent[] = [];
 		const { runtimeHost } = await createRuntimeHost((pi) => {
