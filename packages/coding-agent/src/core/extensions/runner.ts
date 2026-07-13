@@ -10,11 +10,12 @@ import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { SessionManager } from "../session-manager.ts";
-import type {
-	JsonValue,
-	SessionOperationMetadata,
-	SettledOperationContext,
-	SettledOperationRegistration,
+import {
+	cloneSessionOperationMetadata,
+	type JsonValue,
+	type SessionOperationMetadata,
+	type SettledOperationContext,
+	type SettledOperationRegistration,
 } from "../session-operation.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
 import type {
@@ -638,12 +639,10 @@ export class ExtensionRunner {
 			Object.getOwnPropertyDescriptors(this.createContext()),
 		) as SettledOperationContext;
 		Object.defineProperty(context, "operation", {
-			configurable: true,
 			enumerable: true,
-			value: metadata,
+			value: cloneSessionOperationMetadata(metadata),
 		});
 		Object.defineProperty(context, "signal", {
-			configurable: true,
 			enumerable: true,
 			value: signal,
 		});

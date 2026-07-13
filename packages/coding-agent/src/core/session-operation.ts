@@ -10,8 +10,35 @@ export interface SessionOperationMetadata {
 	readonly origin: {
 		readonly extensionPath: string;
 		readonly operationName: string;
-		readonly sourceInfo: SourceInfo;
+		readonly sourceInfo: Readonly<SourceInfo>;
 	};
+}
+
+/** Create a detached, deeply immutable metadata snapshot. */
+export function createSessionOperationMetadata(
+	operationId: string,
+	extensionPath: string,
+	operationName: string,
+	sourceInfo: SourceInfo,
+): SessionOperationMetadata {
+	return Object.freeze({
+		operationId,
+		origin: Object.freeze({
+			extensionPath,
+			operationName,
+			sourceInfo: Object.freeze({ ...sourceInfo }),
+		}),
+	});
+}
+
+/** Detach immutable metadata before exposing it at another trust boundary. */
+export function cloneSessionOperationMetadata(metadata: SessionOperationMetadata): SessionOperationMetadata {
+	return createSessionOperationMetadata(
+		metadata.operationId,
+		metadata.origin.extensionPath,
+		metadata.origin.operationName,
+		metadata.origin.sourceInfo,
+	);
 }
 
 /**
@@ -44,5 +71,5 @@ export type SessionOperationRejectionCode =
 	| "disposed";
 
 export type SessionOperationAcceptance =
-	| { accepted: true; operation: SessionOperationMetadata }
-	| { accepted: false; code: SessionOperationRejectionCode };
+	| { readonly accepted: true; readonly operation: SessionOperationMetadata }
+	| { readonly accepted: false; readonly code: SessionOperationRejectionCode };
