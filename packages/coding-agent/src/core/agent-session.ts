@@ -240,6 +240,8 @@ export interface PromptOptions {
 	source?: InputSource;
 	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
 	preflightResult?: (success: boolean) => void;
+	/** Internal gate used by session replacement to defer an accepted prompt until after commit. */
+	activationGate?: Promise<void>;
 }
 
 /** Result from cycleModel() */
@@ -1543,6 +1545,12 @@ export class AgentSession {
 		}
 
 		preflightResult?.(true);
+		try {
+			await options?.activationGate;
+		} catch (error) {
+			this._restoreIdleAfterPreflight(admittedGeneration);
+			throw error;
+		}
 		await this._runAgentPrompt(messages, admittedGeneration);
 	}
 

@@ -65,6 +65,7 @@ import type {
 	SessionOperationMetadata,
 	SettledOperationRegistration,
 } from "../session-operation.ts";
+import type { SessionReplacementState } from "../session-replacement.ts";
 import type { SlashCommandInfo } from "../slash-commands.ts";
 import type { SourceInfo } from "../source-info.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
@@ -359,6 +360,9 @@ export interface ExtensionCommandContext extends ExtensionContext {
 	newSession(options?: {
 		parentSession?: string;
 		setup?: (sessionManager: SessionManager) => Promise<void>;
+		/** Prompt preflight is transactional; accepted agent work starts only after the destination commits. */
+		initialPrompt?: string;
+		/** Transactional hook for bounded post-rebind validation. Do not start long-running agent work here. */
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 	}): Promise<{ cancelled: boolean }>;
 
@@ -624,6 +628,12 @@ export interface SessionShutdownEvent {
 	readonly operation?: SessionOperationMetadata;
 }
 
+/** Typed lifecycle transition for a session-replacement attempt. */
+export interface SessionReplacementEvent {
+	type: "session_replacement";
+	readonly state: SessionReplacementState;
+}
+
 /** Preparation data for tree navigation */
 export interface TreePreparation {
 	targetId: string;
@@ -663,6 +673,7 @@ export type SessionEvent =
 	| SessionBeforeCompactEvent
 	| SessionCompactEvent
 	| SessionShutdownEvent
+	| SessionReplacementEvent
 	| SessionBeforeTreeEvent
 	| SessionTreeEvent;
 
@@ -1200,6 +1211,7 @@ export interface ExtensionAPI {
 	): void;
 	on(event: "session_compact", handler: ExtensionHandler<SessionCompactEvent>): void;
 	on(event: "session_shutdown", handler: ExtensionHandler<SessionShutdownEvent>): void;
+	on(event: "session_replacement", handler: ExtensionHandler<SessionReplacementEvent>): void;
 	on(event: "session_before_tree", handler: ExtensionHandler<SessionBeforeTreeEvent, SessionBeforeTreeResult>): void;
 	on(event: "session_tree", handler: ExtensionHandler<SessionTreeEvent>): void;
 	on(event: "context", handler: ExtensionHandler<ContextEvent, ContextEventResult>): void;
@@ -1649,6 +1661,7 @@ export interface ExtensionCommandContextActions {
 		options?: {
 			parentSession?: string;
 			setup?: (sessionManager: SessionManager) => Promise<void>;
+			initialPrompt?: string;
 			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 		},
 		operation?: SessionOperationMetadata,

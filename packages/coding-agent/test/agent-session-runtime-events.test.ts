@@ -12,6 +12,7 @@ import {
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { createSessionOperationMetadata } from "../src/core/session-operation.ts";
+import { SessionReplacementBusyError } from "../src/core/session-replacement.ts";
 import type {
 	ExtensionAPI,
 	ExtensionFactory,
@@ -93,7 +94,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			}
 		});
 
-		return { runtimeHost, faux, controls };
+		return { runtimeHost, faux, controls, authStorage };
 	}
 
 	it("emits session_before_switch and session_start for new and resume flows", async () => {
@@ -299,6 +300,32 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		expect(() => source.extensionRunner.createContext()).not.toThrow();
 	});
 
+	it("rolls back when an initial prompt is rejected before activation", async () => {
+		const extensionOutcomes: string[] = [];
+		const { runtimeHost, faux, authStorage } = await createRuntimeHost((pi) => {
+			pi.on("session_replacement", (event) => {
+				if (event.state.outcome) extensionOutcomes.push(event.state.outcome);
+			});
+		});
+		await runtimeHost.session.prompt("hello");
+		const source = runtimeHost.session;
+		runtimeHost.setRebindSession((session, event) => session.bindExtensions({}, event));
+		authStorage.removeRuntimeApiKey(faux.getModel().provider);
+
+		await expect(runtimeHost.newSession({ initialPrompt: "continue" })).rejects.toThrow(/No API key found/);
+
+		expect(runtimeHost.session).toBe(source);
+		expect(runtimeHost.sessionReplacementState).toMatchObject({
+			phase: "idle",
+			outcome: "rolled_back",
+			errorCode: "replacement_failed",
+		});
+		expect(() => source.extensionRunner.createContext()).not.toThrow();
+		expect(extensionOutcomes).toEqual(["rolled_back"]);
+		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
+		await expect(source.prompt("still usable")).resolves.toBeUndefined();
+	});
+
 	it("rolls back a destination whose rebind fails after session_start", async () => {
 		const events: RecordedSessionEvent[] = [];
 		const { runtimeHost } = await createRuntimeHost((pi) => {
@@ -387,6 +414,189 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		expect(() => apis[0].getCommands()).toThrow(/stale/);
 	});
 
+	it("commits a destination before its kickoff settles so that destination can roll over", async () => {
+		let extensionGeneration = 0;
+		let nestedReplacementError: string | undefined;
+		let nestedParentSession: string | undefined;
+		let resolveNestedReplacement!: () => void;
+		const nestedReplacementFinished = new Promise<void>((resolve) => {
+			resolveNestedReplacement = resolve;
+		});
+		const starts: Array<{ generation: number; file: string | undefined }> = [];
+		const lifecycleOrder: string[] = [];
+		const { runtimeHost } = await createRuntimeHost((pi) => {
+			const generation = ++extensionGeneration;
+			pi.on("session_start", (_event, ctx) => {
+				starts.push({ generation, file: ctx.sessionManager.getSessionFile() });
+			});
+			pi.on("session_replacement", (event) => {
+				if (event.state.outcome === "committed") lifecycleOrder.push(`commit:${generation}`);
+			});
+			pi.on("agent_start", () => {
+				if (generation > 1) lifecycleOrder.push(`agent_start:${generation}`);
+			});
+			pi.registerCommand("roll-over", {
+				handler: async (_args, ctx) => {
+					try {
+						nestedParentSession = ctx.sessionManager.getSessionFile();
+						await ctx.newSession({
+							parentSession: nestedParentSession,
+							initialPrompt: "continue in the second destination",
+						});
+					} catch (error) {
+						nestedReplacementError = error instanceof Error ? error.message : String(error);
+					} finally {
+						resolveNestedReplacement();
+					}
+				},
+			});
+			pi.registerSettledOperation("roll-over", {
+				handler: () => ({ type: "invoke_command", command: "roll-over" }),
+			});
+			if (generation === 2) {
+				pi.on("agent_settled", () => {
+					pi.scheduleSettledOperation({ name: "roll-over", input: null });
+				});
+			}
+		});
+		await runtimeHost.session.prompt("seed source");
+		const sourceFile = runtimeHost.session.sessionFile;
+		expect(sourceFile).toBeTruthy();
+
+		const bindSession = (session: typeof runtimeHost.session, event?: SessionStartEvent) =>
+			session.bindExtensions(
+				{
+					commandContextActions: {
+						waitForIdle: () => session.waitForIdle(),
+						newSession: (options, operation) => runtimeHost.newSession(options, operation),
+						fork: async (entryId, options, operation) => {
+							const result = await runtimeHost.fork(entryId, options, operation);
+							return { cancelled: result.cancelled };
+						},
+						navigateTree: async (targetId, options) => {
+							const result = await session.navigateTree(targetId, options);
+							return { cancelled: result.cancelled };
+						},
+						switchSession: (sessionPath, options, operation) =>
+							runtimeHost.switchSession(sessionPath, options, operation),
+						reload: () => session.reload(),
+					},
+				},
+				event,
+			);
+		runtimeHost.setRebindSession(bindSession);
+
+		await runtimeHost.newSession({
+			parentSession: sourceFile,
+			initialPrompt: "continue from the handoff",
+		});
+		await nestedReplacementFinished;
+		await runtimeHost.session.waitForIdle();
+
+		expect(nestedReplacementError).toBeUndefined();
+		expect(extensionGeneration).toBe(3);
+		expect(starts).toHaveLength(3);
+		expect(lifecycleOrder).toEqual(["commit:2", "agent_start:2", "commit:3", "agent_start:3"]);
+		const firstDestinationFile = starts[1]?.file;
+		const secondDestinationFile = starts[2]?.file;
+		expect(firstDestinationFile).toBeTruthy();
+		expect(secondDestinationFile).toBeTruthy();
+		expect(nestedParentSession).toBe(firstDestinationFile);
+		expect(SessionManager.open(firstDestinationFile!).getHeader()?.parentSession).toBe(sourceFile);
+		expect(SessionManager.open(secondDestinationFile!).getHeader()?.parentSession).toBe(firstDestinationFile);
+		expect(existsSync(sourceFile!)).toBe(true);
+		expect(existsSync(firstDestinationFile!)).toBe(true);
+		expect(existsSync(secondDestinationFile!)).toBe(true);
+	});
+
+	it("keeps an accepted initial prompt outside the committed replacement transaction", async () => {
+		const { runtimeHost, faux } = await createRuntimeHost(() => {});
+		await runtimeHost.session.prompt("hello");
+		const source = runtimeHost.session;
+		runtimeHost.setRebindSession((session, event) => session.bindExtensions({}, event));
+		let markResponseStarted!: () => void;
+		const responseStarted = new Promise<void>((resolve) => {
+			markResponseStarted = resolve;
+		});
+		let finishResponse!: () => void;
+		const responseGate = new Promise<void>((resolve) => {
+			finishResponse = resolve;
+		});
+		faux.setResponses([
+			async () => {
+				markResponseStarted();
+				await responseGate;
+				return fauxAssistantMessage("activated");
+			},
+		]);
+		let markActivated!: () => void;
+		const activated = new Promise<void>((resolve) => {
+			markActivated = resolve;
+		});
+		const unsubscribe = runtimeHost.subscribeSessionReplacement((state) => {
+			if (state.outcome === "activated") markActivated();
+		});
+
+		const replacement = runtimeHost.newSession({ initialPrompt: "continue" });
+		await responseStarted;
+		await replacement;
+
+		expect(runtimeHost.session).not.toBe(source);
+		expect(runtimeHost.isSessionReplacementInProgress).toBe(false);
+		expect(runtimeHost.sessionReplacementState).toMatchObject({ phase: "activating", outcome: "committed" });
+		expect(() => source.extensionRunner.createContext().cwd).toThrow(/stale/);
+
+		finishResponse();
+		await activated;
+		unsubscribe();
+		expect(runtimeHost.sessionReplacementState).toMatchObject({ phase: "idle", outcome: "activated" });
+	});
+
+	it("keeps the committed destination canonical when activation fails", async () => {
+		const extensionOutcomes: string[] = [];
+		const { runtimeHost } = await createRuntimeHost((pi) => {
+			pi.on("session_replacement", (event) => {
+				if (event.state.outcome) extensionOutcomes.push(event.state.outcome);
+			});
+		});
+		await runtimeHost.session.prompt("hello");
+		const source = runtimeHost.session;
+		runtimeHost.setRebindSession((session, event) => session.bindExtensions({}, event));
+		let markActivationFailed!: () => void;
+		const activationFailed = new Promise<void>((resolve) => {
+			markActivationFailed = resolve;
+		});
+		const unsubscribe = runtimeHost.subscribeSessionReplacement((state) => {
+			if (state.outcome === "committed") {
+				const destination = runtimeHost.session as unknown as {
+					_runAgentPrompt: () => Promise<void>;
+				};
+				destination._runAgentPrompt = async () => {
+					const error = new Error("post-commit kickoff failed") as Error & { code: string };
+					error.code = "kickoff_failed";
+					throw error;
+				};
+			}
+			if (state.outcome === "activation_failed") markActivationFailed();
+		});
+
+		await runtimeHost.newSession({ initialPrompt: "continue" });
+		const destination = runtimeHost.session;
+		await activationFailed;
+		unsubscribe();
+
+		expect(destination).not.toBe(source);
+		expect(runtimeHost.session).toBe(destination);
+		expect(runtimeHost.sessionReplacementState).toMatchObject({
+			phase: "idle",
+			outcome: "activation_failed",
+			errorCode: "kickoff_failed",
+		});
+		expect(() => source.extensionRunner.createContext().cwd).toThrow(/stale/);
+		expect(() => destination.extensionRunner.createContext().cwd).not.toThrow();
+		expect(extensionOutcomes).toEqual(["committed", "activation_failed"]);
+	});
+
 	it("atomically admits a concurrent prompt only after replacement commits", async () => {
 		const { runtimeHost } = await createRuntimeHost(() => {});
 		await runtimeHost.session.prompt("hello");
@@ -425,6 +635,42 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		await concurrentPrompt;
 		expect(admittedSession).toBe(runtimeHost.session);
 		expect(admitted).toBe(true);
+	});
+
+	it("returns typed busy state for overlapping replacement transactions", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => {});
+		await runtimeHost.session.prompt("hello");
+		runtimeHost.setRebindSession((session, event) => session.bindExtensions({}, event));
+		let enterValidation!: () => void;
+		const validationEntered = new Promise<void>((resolve) => {
+			enterValidation = resolve;
+		});
+		let finishValidation!: () => void;
+		const validationGate = new Promise<void>((resolve) => {
+			finishValidation = resolve;
+		});
+		const replacement = runtimeHost.newSession({
+			withSession: async () => {
+				enterValidation();
+				await validationGate;
+			},
+		});
+		await validationEntered;
+
+		let busyError: unknown;
+		try {
+			await runtimeHost.newSession();
+		} catch (error) {
+			busyError = error;
+		}
+		finishValidation();
+		await replacement;
+
+		expect(busyError).toBeInstanceOf(SessionReplacementBusyError);
+		expect(busyError).toMatchObject({
+			code: "replacement_busy",
+			state: { phase: "committing" },
+		});
 	});
 
 	it("delays reload until replacement commits and targets the destination", async () => {

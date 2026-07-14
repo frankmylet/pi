@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { resolvePath } from "../utils/paths.ts";
@@ -15,6 +16,12 @@ import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
 import { SessionManager } from "./session-manager.ts";
 import { cloneSessionOperationMetadata, type SessionOperationMetadata } from "./session-operation.ts";
+import {
+	createSessionReplacementState,
+	SessionReplacementBusyError,
+	type SessionReplacementReason,
+	type SessionReplacementState,
+} from "./session-replacement.ts";
 
 /**
  * Result returned by runtime creation.
@@ -32,6 +39,27 @@ interface AgentSessionRuntimeState {
 	services: AgentSessionServices;
 	diagnostics: AgentSessionRuntimeDiagnostic[];
 	modelFallbackMessage?: string;
+}
+
+interface SessionReplacementAttempt {
+	attemptId: string;
+	reason: SessionReplacementReason;
+	sourceSessionFile: string | undefined;
+	operation?: SessionOperationMetadata;
+}
+
+interface StagedInitialPrompt {
+	preflight: Promise<void>;
+	completion: Promise<void>;
+	activate: () => void;
+	cancel: (error: unknown) => void;
+}
+
+interface CommittedSessionReplacement {
+	attempt: SessionReplacementAttempt;
+	destination: AgentSession;
+	destinationSessionFile: string | undefined;
+	activation?: StagedInitialPrompt;
 }
 
 /**
@@ -94,6 +122,9 @@ export class AgentSessionRuntime {
 	private resolveReplacementBarrier?: () => void;
 	private replacementCancellation?: Error;
 	private replacementDestination?: AgentSession;
+	private committedReplacement?: CommittedSessionReplacement;
+	private _sessionReplacementState = createSessionReplacementState({ phase: "idle" });
+	private readonly sessionReplacementListeners = new Set<(state: SessionReplacementState) => void>();
 	private admissionTail: Promise<void> = Promise.resolve();
 	private admissionOwner?: symbol;
 	private readonly admissionContext = new AsyncLocalStorage<symbol>();
@@ -141,6 +172,26 @@ export class AgentSessionRuntime {
 
 	get isSessionReplacementInProgress(): boolean {
 		return this.replacementInProgress;
+	}
+
+	get sessionReplacementState(): SessionReplacementState {
+		return this._sessionReplacementState;
+	}
+
+	subscribeSessionReplacement(listener: (state: SessionReplacementState) => void): () => void {
+		this.sessionReplacementListeners.add(listener);
+		return () => this.sessionReplacementListeners.delete(listener);
+	}
+
+	private setSessionReplacementState(state: SessionReplacementState): void {
+		this._sessionReplacementState = createSessionReplacementState(state);
+		for (const listener of this.sessionReplacementListeners) {
+			try {
+				listener(this._sessionReplacementState);
+			} catch {
+				// Observers cannot alter replacement ownership.
+			}
+		}
 	}
 
 	private async acquireSessionAdmission(): Promise<{ token: symbol; release: () => void }> {
@@ -308,33 +359,214 @@ export class AgentSessionRuntime {
 		if (this.replacementCancellation) throw this.replacementCancellation;
 	}
 
-	private async runSessionReplacement<T>(replace: () => Promise<T>): Promise<T> {
+	private getReplacementErrorCode(error: unknown, fallback: string): string {
+		if (error && typeof error === "object" && "code" in error && typeof error.code === "string") {
+			return error.code;
+		}
+		if (error === this.replacementCancellation) return "replacement_cancelled";
+		return fallback;
+	}
+
+	private async emitSessionReplacementState(session: AgentSession, state: SessionReplacementState): Promise<void> {
+		try {
+			await session.extensionRunner.emit({ type: "session_replacement", state });
+		} catch {
+			// Lifecycle telemetry must not change commit or rollback ownership.
+		}
+	}
+
+	private stageInitialPrompt(destination: AgentSession, initialPrompt: string): StagedInitialPrompt {
+		let resolvePreflight!: () => void;
+		let rejectPreflight!: (error: unknown) => void;
+		let preflightSettled = false;
+		const preflight = new Promise<void>((resolve, reject) => {
+			resolvePreflight = resolve;
+			rejectPreflight = reject;
+		});
+
+		let resolveActivation!: () => void;
+		let rejectActivation!: (error: unknown) => void;
+		let activationSettled = false;
+		const activationGate = new Promise<void>((resolve, reject) => {
+			resolveActivation = resolve;
+			rejectActivation = reject;
+		});
+		void activationGate.catch(() => undefined);
+
+		const completion = destination
+			.prompt(initialPrompt, {
+				expandPromptTemplates: false,
+				source: "extension",
+				activationGate,
+				preflightResult: (accepted) => {
+					if (!accepted || preflightSettled) return;
+					preflightSettled = true;
+					resolvePreflight();
+				},
+			})
+			.then(
+				() => {
+					if (!preflightSettled) {
+						preflightSettled = true;
+						resolvePreflight();
+					}
+				},
+				(error: unknown) => {
+					if (!preflightSettled) {
+						preflightSettled = true;
+						rejectPreflight(error);
+					}
+					throw error;
+				},
+			);
+		void completion.catch(() => undefined);
+
+		return {
+			preflight,
+			completion,
+			activate: () => {
+				if (activationSettled) return;
+				activationSettled = true;
+				resolveActivation();
+			},
+			cancel: (error) => {
+				if (activationSettled) return;
+				activationSettled = true;
+				rejectActivation(error instanceof Error ? error : new Error(String(error)));
+			},
+		};
+	}
+
+	private async finalizeCommittedReplacement(commit: CommittedSessionReplacement): Promise<void> {
+		const { attempt, activation, destination, destinationSessionFile } = commit;
+		const committedState = createSessionReplacementState({
+			phase: activation ? "activating" : "idle",
+			attemptId: attempt.attemptId,
+			reason: attempt.reason,
+			sourceSessionFile: attempt.sourceSessionFile,
+			destinationSessionFile,
+			operation: attempt.operation,
+			outcome: "committed",
+		});
+		this.setSessionReplacementState(committedState);
+		await this.emitSessionReplacementState(destination, committedState);
+
+		if (!activation) return;
+		activation.activate();
+		void activation.completion.then(
+			async () => {
+				if (
+					this.session !== destination ||
+					this._sessionReplacementState.attemptId !== attempt.attemptId ||
+					this._sessionReplacementState.phase !== "activating"
+				) {
+					return;
+				}
+				const activatedState = createSessionReplacementState({
+					...committedState,
+					phase: "idle",
+					outcome: "activated",
+				});
+				this.setSessionReplacementState(activatedState);
+				await this.emitSessionReplacementState(destination, activatedState);
+			},
+			async (error: unknown) => {
+				if (
+					this.session !== destination ||
+					this._sessionReplacementState.attemptId !== attempt.attemptId ||
+					this._sessionReplacementState.phase !== "activating"
+				) {
+					return;
+				}
+				const failedState = createSessionReplacementState({
+					...committedState,
+					phase: "idle",
+					outcome: "activation_failed",
+					errorCode: this.getReplacementErrorCode(error, "activation_failed"),
+				});
+				this.setSessionReplacementState(failedState);
+				await this.emitSessionReplacementState(destination, failedState);
+			},
+		);
+	}
+
+	private async runSessionReplacement<T>(
+		reason: SessionReplacementReason,
+		operation: SessionOperationMetadata | undefined,
+		replace: (attempt: SessionReplacementAttempt) => Promise<T>,
+	): Promise<T> {
 		if (this.replacementInProgress) {
-			throw new Error("Another session replacement is already in progress");
+			throw new SessionReplacementBusyError(this._sessionReplacementState);
 		}
 		const isReentrant = this.hasInheritedAdmission();
 		const admission = isReentrant ? undefined : await this.acquireSessionAdmission();
 		if (this.replacementInProgress) {
 			admission?.release();
-			throw new Error("Another session replacement is already in progress");
+			throw new SessionReplacementBusyError(this._sessionReplacementState);
 		}
 		if (!isReentrant && !this.session.isIdle) {
 			admission?.release();
 			throw new Error("Cannot replace the session while agent work is active");
 		}
+
+		const attempt: SessionReplacementAttempt = {
+			attemptId: randomUUID(),
+			reason,
+			sourceSessionFile: this.session.sessionFile,
+			...(operation ? { operation: cloneSessionOperationMetadata(operation) } : {}),
+		};
 		this.replacementInProgress = true;
 		this.replacementCancellation = undefined;
+		this.committedReplacement = undefined;
+		this.setSessionReplacementState(
+			createSessionReplacementState({
+				phase: "preparing",
+				attemptId: attempt.attemptId,
+				reason,
+				sourceSessionFile: attempt.sourceSessionFile,
+				operation: attempt.operation,
+			}),
+		);
 		this.replacementBarrier = new Promise<void>((resolveBarrier) => {
 			this.resolveReplacementBarrier = resolveBarrier;
 		});
+
 		try {
-			return await replace();
+			const result = await replace(attempt);
+			if (!this.committedReplacement && this._sessionReplacementState.attemptId === attempt.attemptId) {
+				const cancelledState = createSessionReplacementState({
+					...this._sessionReplacementState,
+					phase: "idle",
+					outcome: "cancelled",
+				});
+				this.setSessionReplacementState(cancelledState);
+				await this.emitSessionReplacementState(this.session, cancelledState);
+			}
+			return result;
+		} catch (error) {
+			if (!this.committedReplacement && this._sessionReplacementState.attemptId === attempt.attemptId) {
+				const failedState = createSessionReplacementState({
+					...this._sessionReplacementState,
+					phase: "idle",
+					outcome: this._sessionReplacementState.outcome ?? "failed",
+					errorCode:
+						this._sessionReplacementState.errorCode ?? this.getReplacementErrorCode(error, "replacement_failed"),
+				});
+				this.setSessionReplacementState(failedState);
+				await this.emitSessionReplacementState(this.session, failedState);
+			}
+			throw error;
 		} finally {
+			const commit = this.committedReplacement;
+			this.committedReplacement = undefined;
 			this.replacementDestination = undefined;
 			this.replacementCancellation = undefined;
 			this.replacementInProgress = false;
 			this.resolveReplacementBarrier?.();
 			this.resolveReplacementBarrier = undefined;
+			if (commit) {
+				await this.finalizeCommittedReplacement(commit);
+			}
 			admission?.release();
 		}
 	}
@@ -353,23 +585,39 @@ export class AgentSessionRuntime {
 		});
 	}
 
-	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
+	private async finishSessionReplacement(options: {
+		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+		initialPrompt?: string;
+	}): Promise<StagedInitialPrompt | undefined> {
 		if (this.rebindSession) {
 			await this.rebindSession(this.session);
 		}
 		this.throwIfReplacementCancelled();
-		if (withSession) {
-			await withSession(this.session.createReplacedSessionContext());
+		if (options.withSession) {
+			await options.withSession(this.session.createReplacedSessionContext());
 		}
 		this.throwIfReplacementCancelled();
+		if (options.initialPrompt === undefined) return undefined;
+
+		const activation = this.stageInitialPrompt(this.session, options.initialPrompt);
+		try {
+			await activation.preflight;
+			this.throwIfReplacementCancelled();
+			return activation;
+		} catch (error) {
+			activation.cancel(error);
+			throw error;
+		}
 	}
 
 	private async applyPreparedReplacement(
 		prepared: CreateAgentSessionRuntimeResult,
 		options: {
+			attempt: SessionReplacementAttempt;
 			reason: SessionShutdownEvent["reason"];
 			operation?: SessionOperationMetadata;
 			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+			initialPrompt?: string;
 			prepare?: (session: AgentSession) => Promise<void>;
 		},
 	): Promise<void> {
@@ -379,10 +627,21 @@ export class AgentSessionRuntime {
 		let sourceShutdown = false;
 		let sourceSuspended = false;
 		let destinationApplied = false;
+		let activation: StagedInitialPrompt | undefined;
 
 		try {
 			if (options.prepare) await options.prepare(destination);
 			this.throwIfReplacementCancelled();
+			this.setSessionReplacementState(
+				createSessionReplacementState({
+					phase: "committing",
+					attemptId: options.attempt.attemptId,
+					reason: options.attempt.reason,
+					sourceSessionFile: options.attempt.sourceSessionFile,
+					destinationSessionFile: targetSessionFile,
+					operation: options.attempt.operation,
+				}),
+			);
 			await this.emitShutdown(source.session, options.reason, targetSessionFile, options.operation);
 			sourceShutdown = true;
 			this.beforeSessionInvalidate?.();
@@ -393,11 +652,34 @@ export class AgentSessionRuntime {
 			this.apply(prepared);
 			destinationApplied = true;
 			this.replacementDestination = destination;
-			await this.finishSessionReplacement(options.withSession);
+			activation = await this.finishSessionReplacement({
+				withSession: options.withSession,
+				initialPrompt: options.initialPrompt,
+			});
 			source.session.dispose();
+			this.committedReplacement = {
+				attempt: options.attempt,
+				destination,
+				destinationSessionFile: targetSessionFile,
+				activation,
+			};
 			return;
 		} catch (error) {
+			activation?.cancel(error);
 			const rollbackErrors: unknown[] = [];
+			const rollbackRequired = sourceShutdown || sourceSuspended || destinationApplied;
+			if (rollbackRequired) {
+				this.setSessionReplacementState(
+					createSessionReplacementState({
+						phase: "rolling_back",
+						attemptId: options.attempt.attemptId,
+						reason: options.attempt.reason,
+						sourceSessionFile: options.attempt.sourceSessionFile,
+						destinationSessionFile: targetSessionFile,
+						operation: options.attempt.operation,
+					}),
+				);
+			}
 			if (destinationApplied) {
 				try {
 					await this.emitShutdown(destination, "rollback", source.session.sessionFile, options.operation);
@@ -427,6 +709,19 @@ export class AgentSessionRuntime {
 				}
 			}
 
+			this.setSessionReplacementState(
+				createSessionReplacementState({
+					phase: "idle",
+					attemptId: options.attempt.attemptId,
+					reason: options.attempt.reason,
+					sourceSessionFile: options.attempt.sourceSessionFile,
+					destinationSessionFile: targetSessionFile,
+					operation: options.attempt.operation,
+					outcome: rollbackRequired ? "rolled_back" : "failed",
+					errorCode: this.getReplacementErrorCode(error, "replacement_failed"),
+				}),
+			);
+
 			if (rollbackErrors.length > 0) {
 				throw new AggregateError(
 					[error, ...rollbackErrors],
@@ -446,7 +741,7 @@ export class AgentSessionRuntime {
 		},
 		operation?: SessionOperationMetadata,
 	): Promise<{ cancelled: boolean }> {
-		return this.runSessionReplacement(async () => {
+		return this.runSessionReplacement("resume", operation, async (attempt) => {
 			const beforeResult = await this.emitBeforeSwitch("resume", sessionPath, operation);
 			if (beforeResult.cancelled) return beforeResult;
 
@@ -466,6 +761,7 @@ export class AgentSessionRuntime {
 				projectTrustContext: options?.projectTrustContextFactory?.(sessionManager.getCwd()),
 			});
 			await this.applyPreparedReplacement(prepared, {
+				attempt,
 				reason: "resume",
 				operation,
 				withSession: options?.withSession,
@@ -478,11 +774,12 @@ export class AgentSessionRuntime {
 		options?: {
 			parentSession?: string;
 			setup?: (sessionManager: SessionManager) => Promise<void>;
+			initialPrompt?: string;
 			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 		},
 		operation?: SessionOperationMetadata,
 	): Promise<{ cancelled: boolean }> {
-		return this.runSessionReplacement(async () => {
+		return this.runSessionReplacement("new", operation, async (attempt) => {
 			const beforeResult = await this.emitBeforeSwitch("new", undefined, operation);
 			if (beforeResult.cancelled) return beforeResult;
 
@@ -507,8 +804,10 @@ export class AgentSessionRuntime {
 				},
 			});
 			await this.applyPreparedReplacement(prepared, {
+				attempt,
 				reason: "new",
 				operation,
+				initialPrompt: options?.initialPrompt,
 				withSession: options?.withSession,
 				prepare: options?.setup
 					? async (session) => {
@@ -526,7 +825,7 @@ export class AgentSessionRuntime {
 		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
 		operation?: SessionOperationMetadata,
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
-		return this.runSessionReplacement(async () => {
+		return this.runSessionReplacement("fork", operation, async (attempt) => {
 			const position = options?.position ?? "before";
 			const beforeResult = await this.emitBeforeFork(entryId, { position }, operation);
 			if (beforeResult.cancelled) return { cancelled: true };
@@ -582,6 +881,7 @@ export class AgentSessionRuntime {
 				},
 			});
 			await this.applyPreparedReplacement(prepared, {
+				attempt,
 				reason: "fork",
 				operation,
 				withSession: options?.withSession,
@@ -598,7 +898,7 @@ export class AgentSessionRuntime {
 	 * @throws {MissingSessionCwdError} When the imported session cwd cannot be resolved and no override is provided.
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
-		return this.runSessionReplacement(async () => {
+		return this.runSessionReplacement("resume", undefined, async (attempt) => {
 			const resolvedPath = resolvePath(inputPath);
 			if (!existsSync(resolvedPath)) throw new SessionImportFileNotFoundError(resolvedPath);
 
@@ -620,7 +920,7 @@ export class AgentSessionRuntime {
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
 			});
-			await this.applyPreparedReplacement(prepared, { reason: "resume" });
+			await this.applyPreparedReplacement(prepared, { attempt, reason: "resume" });
 			return { cancelled: false };
 		});
 	}
