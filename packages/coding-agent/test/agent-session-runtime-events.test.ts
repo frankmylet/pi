@@ -509,6 +509,81 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		expect(existsSync(secondDestinationFile!)).toBe(true);
 	});
 
+	it("blocks inherited replacement from committed observers until destination activation is released", async () => {
+		let extensionGeneration = 0;
+		const { runtimeHost } = await createRuntimeHost((pi) => {
+			extensionGeneration++;
+			pi.registerCommand("replace-with-prompt", {
+				handler: async (_args, ctx) => {
+					await ctx.newSession({ initialPrompt: "activate destination" });
+				},
+			});
+		});
+		const source = runtimeHost.session;
+		const bindSession = (session: typeof runtimeHost.session, event?: SessionStartEvent) =>
+			session.bindExtensions(
+				{
+					commandContextActions: {
+						waitForIdle: () => session.waitForIdle(),
+						newSession: (options, operation) => runtimeHost.newSession(options, operation),
+						fork: async (entryId, options, operation) => {
+							const result = await runtimeHost.fork(entryId, options, operation);
+							return { cancelled: result.cancelled };
+						},
+						navigateTree: async (targetId, options) => {
+							const result = await session.navigateTree(targetId, options);
+							return { cancelled: result.cancelled };
+						},
+						switchSession: (sessionPath, options, operation) =>
+							runtimeHost.switchSession(sessionPath, options, operation),
+						reload: () => session.reload(),
+					},
+				},
+				event,
+			);
+		runtimeHost.setRebindSession(bindSession);
+		await bindSession(source);
+
+		let committedDestination: typeof runtimeHost.session | undefined;
+		let observerReplacement: Promise<void> | undefined;
+		let observerError: unknown;
+		let cancellationAccepted: boolean | undefined;
+		let markActivated!: () => void;
+		const activated = new Promise<void>((resolve) => {
+			markActivated = resolve;
+		});
+		const unsubscribe = runtimeHost.subscribeSessionReplacement((state) => {
+			if (state.outcome === "activated") markActivated();
+			if (state.outcome !== "committed" || observerReplacement) return;
+			committedDestination = runtimeHost.session;
+			cancellationAccepted = runtimeHost.requestSessionReplacementCancellation("too late");
+			observerReplacement = runtimeHost.newSession().then(
+				() => undefined,
+				(error: unknown) => {
+					observerError = error;
+				},
+			);
+		});
+
+		await runtimeHost.startPromptOperation((session, releaseAfterPreflight) =>
+			session.prompt("/replace-with-prompt", { preflightResult: releaseAfterPreflight }),
+		);
+		await observerReplacement;
+		await runtimeHost.session.waitForIdle();
+		await activated;
+		unsubscribe();
+
+		expect(cancellationAccepted).toBe(false);
+		expect(observerError).toBeInstanceOf(SessionReplacementBusyError);
+		expect(observerError).toMatchObject({
+			code: "replacement_busy",
+			state: { phase: "activating", outcome: "committed" },
+		});
+		expect(extensionGeneration).toBe(2);
+		expect(runtimeHost.session).toBe(committedDestination);
+		expect(runtimeHost.sessionReplacementState).toMatchObject({ phase: "idle", outcome: "activated" });
+	});
+
 	it("keeps an accepted initial prompt outside the committed replacement transaction", async () => {
 		const { runtimeHost, faux } = await createRuntimeHost(() => {});
 		await runtimeHost.session.prompt("hello");

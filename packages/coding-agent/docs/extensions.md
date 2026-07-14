@@ -535,11 +535,11 @@ pi.on("session_replacement", async (event, ctx) => {
 
 Outcome ownership:
 - `cancelled`, `failed`, or `rolled_back`: the source remains/restores as canonical.
-- `committed`: the destination is canonical and the replacement transaction is over. If `initialPrompt` was supplied, its agent run starts only after this transition.
+- `committed`: the destination is canonical and cannot roll back. Core serially delivers this transition before releasing an accepted `initialPrompt`; replacement attempts made synchronously by a lifecycle observer remain busy until delivery returns.
 - `activated`: the post-commit `initialPrompt` run completed.
 - `activation_failed`: that run failed, but the destination remains canonical and promptable.
 
-A second replacement attempted during `preparing` or `committing` throws `SessionReplacementBusyError` with `code: "replacement_busy"` and an immutable `state` snapshot. Use the lifecycle outcome rather than matching error-message text.
+A second replacement attempted during `preparing`, `committing`, or synchronous delivery of the `committed` transition throws `SessionReplacementBusyError` with `code: "replacement_busy"` and an immutable `state` snapshot. During committed delivery the snapshot has `phase: "activating"` when an `initialPrompt` is reserved. Defer another replacement until the notification returns; use the lifecycle outcome rather than matching error-message text.
 
 ### Agent Events
 

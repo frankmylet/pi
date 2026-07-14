@@ -105,9 +105,9 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
  * Owns the current AgentSession plus its cwd-bound services.
  *
  * Replacement is transactional: the destination runtime is prepared before the
- * source is invalidated, and the source AgentSession is retained until rebind and
- * `withSession` kickoff complete. A failed destination is disposed and the source
- * is rebound before the original error is returned.
+ * source is invalidated, and the source AgentSession is retained until rebind,
+ * `withSession`, and optional initial-prompt preflight complete. A failed destination
+ * is disposed and the source is rebound before the original error is returned.
  */
 export class AgentSessionRuntime {
 	private rebindSession?: (session: AgentSession, sessionStartEvent?: SessionStartEvent) => Promise<void>;
@@ -276,7 +276,7 @@ export class AgentSessionRuntime {
 	 * Returns false when no replacement is active.
 	 */
 	requestSessionReplacementCancellation(reason = "Session replacement cancelled"): boolean {
-		if (!this.replacementInProgress) return false;
+		if (!this.replacementInProgress || this._sessionReplacementState.outcome === "committed") return false;
 		this.replacementCancellation ??= new Error(reason);
 		void this.replacementDestination?.abort().catch(() => undefined);
 		return true;
@@ -437,7 +437,7 @@ export class AgentSessionRuntime {
 		};
 	}
 
-	private async finalizeCommittedReplacement(commit: CommittedSessionReplacement): Promise<void> {
+	private async publishCommittedReplacement(commit: CommittedSessionReplacement): Promise<SessionReplacementState> {
 		const { attempt, activation, destination, destinationSessionFile } = commit;
 		const committedState = createSessionReplacementState({
 			phase: activation ? "activating" : "idle",
@@ -450,9 +450,16 @@ export class AgentSessionRuntime {
 		});
 		this.setSessionReplacementState(committedState);
 		await this.emitSessionReplacementState(destination, committedState);
+		return committedState;
+	}
 
+	private activateCommittedReplacement(
+		commit: CommittedSessionReplacement,
+		committedState: SessionReplacementState,
+	): void {
+		const { attempt, activation, destination } = commit;
 		if (!activation) return;
-		activation.activate();
+
 		void activation.completion.then(
 			async () => {
 				if (
@@ -488,6 +495,7 @@ export class AgentSessionRuntime {
 				await this.emitSessionReplacementState(destination, failedState);
 			},
 		);
+		activation.activate();
 	}
 
 	private async runSessionReplacement<T>(
@@ -561,12 +569,13 @@ export class AgentSessionRuntime {
 			this.committedReplacement = undefined;
 			this.replacementDestination = undefined;
 			this.replacementCancellation = undefined;
+			const committedState = commit ? await this.publishCommittedReplacement(commit) : undefined;
 			this.replacementInProgress = false;
+			if (commit && committedState) {
+				this.activateCommittedReplacement(commit, committedState);
+			}
 			this.resolveReplacementBarrier?.();
 			this.resolveReplacementBarrier = undefined;
-			if (commit) {
-				await this.finalizeCommittedReplacement(commit);
-			}
 			admission?.release();
 		}
 	}
