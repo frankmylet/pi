@@ -147,6 +147,7 @@ export type {
 	SessionCompactEvent,
 	SessionEvent,
 	SessionInfoChangedEvent,
+	SessionReplacementEvent,
 	SessionShutdownEvent,
 	// Events - Session
 	SessionStartEvent,

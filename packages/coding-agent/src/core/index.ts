@@ -71,6 +71,7 @@ export {
 	type SessionOperationAcceptance,
 	type SessionOperationMetadata,
 	type SessionOperationRejectionCode,
+	type SessionReplacementEvent,
 	type SessionShutdownEvent,
 	type SessionStartEvent,
 	type SessionTreeEvent,
@@ -88,4 +89,11 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
+export {
+	SessionReplacementBusyError,
+	type SessionReplacementOutcome,
+	type SessionReplacementPhase,
+	type SessionReplacementReason,
+	type SessionReplacementState,
+} from "./session-replacement.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";

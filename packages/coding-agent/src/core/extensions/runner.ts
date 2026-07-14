@@ -169,6 +169,7 @@ export type NewSessionHandler = (
 	options?: {
 		parentSession?: string;
 		setup?: (sessionManager: SessionManager) => Promise<void>;
+		initialPrompt?: string;
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 	},
 	operation?: SessionOperationMetadata,

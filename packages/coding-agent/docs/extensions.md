@@ -317,13 +317,17 @@ user sends another prompt ◄─────────────────
   ├─► session_before_switch (can cancel)
   ├─► session_shutdown
   ├─► session_start { reason: "new" | "resume", previousSessionFile? }
-  └─► resources_discover { reason: "startup" }
+  ├─► resources_discover { reason: "startup" }
+  └─► session_replacement { outcome: "committed" }
+       └─► optional initialPrompt agent run
+            └─► session_replacement { outcome: "activated" | "activation_failed" }
 
 /fork or /clone
   ├─► session_before_fork (can cancel)
   ├─► session_shutdown
   ├─► session_start { reason: "fork", previousSessionFile }
-  └─► resources_discover { reason: "startup" }
+  ├─► resources_discover { reason: "startup" }
+  └─► session_replacement { outcome: "committed" }
 
 /name or pi.setSessionName()
   └─► session_info_changed
@@ -512,6 +516,30 @@ pi.on("session_shutdown", async (event, ctx) => {
   // Cleanup, save state, etc.
 });
 ```
+
+#### session_replacement
+
+Fired for observable replacement outcomes. The immutable `event.state` includes `attemptId`, `reason`, source/destination files, optional settled-operation metadata, `phase`, `outcome`, and optional `errorCode`.
+
+```typescript
+pi.on("session_replacement", async (event, ctx) => {
+  if (event.state.outcome === "committed") {
+    // The destination is now canonical; release transaction-scoped leases here.
+  }
+  if (event.state.outcome === "activation_failed") {
+    // The destination remains canonical and promptable. Do not restore the source.
+    ctx.ui.notify("Destination kickoff failed; retry from this session", "warning");
+  }
+});
+```
+
+Outcome ownership:
+- `cancelled`, `failed`, or `rolled_back`: the source remains/restores as canonical.
+- `committed`: the destination is canonical and cannot roll back. Core serially delivers this transition before releasing an accepted `initialPrompt`; replacement attempts made synchronously by a lifecycle observer remain busy until delivery returns.
+- `activated`: the post-commit `initialPrompt` run completed.
+- `activation_failed`: that run failed, but the destination remains canonical and promptable.
+
+A second replacement attempted during `preparing`, `committing`, or synchronous delivery of the `committed` transition throws `SessionReplacementBusyError` with `code: "replacement_busy"` and an immutable `state` snapshot. During committed delivery the snapshot has `phase: "activating"` when an `initialPrompt` is reserved. Defer another replacement until the notification returns; use the lifecycle outcome rather than matching error-message text.
 
 ### Agent Events
 
@@ -1157,10 +1185,7 @@ const result = await ctx.newSession({
       timestamp: Date.now(),
     });
   },
-  withSession: async (ctx) => {
-    // Use only the replacement-session ctx here.
-    await ctx.sendUserMessage(kickoff);
-  },
+  initialPrompt: kickoff,
 });
 
 if (result.cancelled) {
@@ -1170,8 +1195,9 @@ if (result.cancelled) {
 
 Options:
 - `parentSession`: parent session file to record in the new session header
-- `setup`: mutate the new session's `SessionManager` before `withSession` runs
-- `withSession`: run post-switch work against a fresh replacement-session context. Do not use captured old `pi` / command `ctx`; see [Session replacement lifecycle and footguns](#session-replacement-lifecycle-and-footguns).
+- `setup`: mutate the new session's `SessionManager` before destination rebind
+- `initialPrompt`: preflight the prompt transactionally, commit the destination, then start accepted agent work. Prefer this over sending a kickoff from `withSession`.
+- `withSession`: run bounded transactional validation against a fresh replacement-session context. A thrown error rolls back the source. Do not start or await long-running agent work here, and do not use captured old `pi` / command `ctx`; see [Session replacement lifecycle and footguns](#session-replacement-lifecycle-and-footguns).
 
 ### ctx.fork(entryId, options?)
 
@@ -1225,7 +1251,8 @@ Switch to a different session file:
 ```typescript
 const result = await ctx.switchSession("/path/to/session.jsonl", {
   withSession: async (ctx) => {
-    await ctx.sendUserMessage("Resume work in the replacement session");
+    // Bounded validation/notification only; do not await an agent run here.
+    ctx.ui.notify("Replacement session validated", "info");
   },
 });
 if (result.cancelled) {
@@ -1263,14 +1290,16 @@ pi.registerCommand("switch", {
 
 ### Session replacement lifecycle and footguns
 
-`withSession` receives a fresh `ReplacedSessionContext`, which extends `ExtensionCommandContext` with async `sendMessage()` and `sendUserMessage()` helpers bound to the replacement session.
+`withSession` receives a fresh `ReplacedSessionContext`, which extends `ExtensionCommandContext` with async `sendMessage()` and `sendUserMessage()` helpers bound to the replacement session. Those helpers remain for bounded compatibility work, but awaiting an agent kickoff from this callback keeps that whole run inside the rollback transaction. Use `initialPrompt` for activation instead.
 
 Lifecycle and footguns:
-- `withSession` runs only after the old session has emitted `session_shutdown`, the old runtime has been torn down, the replacement session has been rebound, and the new extension instance has already received `session_start`.
+- `withSession` runs after the source emitted `session_shutdown`, source APIs were suspended, the destination was rebound, and its new extension instance received `session_start`. The source is not permanently disposed until this callback and prompt preflight succeed.
+- A `withSession` or `initialPrompt` preflight failure rolls back and restores the source. Once `session_replacement` reports `committed`, only the destination is canonical.
+- Accepted `initialPrompt` model work starts after commit. `ctx.newSession()` resolves after that commit, without waiting for the agent run to settle. Observe `activated` / `activation_failed` when activation completion matters.
 - The callback still executes in the original closure, not inside the new extension instance. That means your old extension instance may already have run its shutdown cleanup before `withSession` starts.
-- Captured old `pi` / old command `ctx` session-bound objects are stale after replacement and will throw if used. Use only the `ctx` passed to `withSession` for session-bound work.
+- Captured old `pi` / old command `ctx` session-bound objects are suspended during the transaction and stale after commit. Use only the `ctx` passed to `withSession` for bounded validation.
 - Previously extracted raw objects are still your responsibility. For example, if you capture `const sm = ctx.sessionManager` before replacement, `sm` is still the old `SessionManager` object. Do not reuse it after replacement.
-- Code in `withSession` should assume any state invalidated by your `session_shutdown` handler is already gone. Only capture plain data that survives shutdown cleanly, such as strings, ids, and serialized config.
+- Code in `withSession` should assume state invalidated by your `session_shutdown` handler is unavailable. Only capture plain data that survives shutdown cleanly, such as strings, ids, and serialized config.
 
 Safe pattern:
 
@@ -1278,11 +1307,7 @@ Safe pattern:
 pi.registerCommand("handoff", {
   handler: async (_args, ctx) => {
     const kickoff = "Continue from the replacement session";
-    await ctx.newSession({
-      withSession: async (ctx) => {
-        await ctx.sendUserMessage(kickoff);
-      },
-    });
+    await ctx.newSession({ initialPrompt: kickoff });
   },
 });
 ```

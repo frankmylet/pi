@@ -134,6 +134,7 @@ export type {
 	SessionOperationAcceptance,
 	SessionOperationMetadata,
 	SessionOperationRejectionCode,
+	SessionReplacementEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 	SessionTreeEvent,
@@ -254,6 +255,13 @@ export {
 	sessionEntryToContextMessages,
 	type ThinkingLevelChangeEntry,
 } from "./core/session-manager.ts";
+export {
+	SessionReplacementBusyError,
+	type SessionReplacementOutcome,
+	type SessionReplacementPhase,
+	type SessionReplacementReason,
+	type SessionReplacementState,
+} from "./core/session-replacement.ts";
 export {
 	type CompactionSettings,
 	type DefaultProjectTrust,
